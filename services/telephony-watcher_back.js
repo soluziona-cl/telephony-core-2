@@ -31,7 +31,7 @@ const PORT = process.env.WATCHER_PORT || 3005;
                 await execSP("usp_ActiveCalls_Upsert", [
                     { name: "ChannelId", type: sql.VarChar(64), value: call.channelId },
                     { name: "LinkedId", type: sql.VarChar(64), value: call.linkedId || call.channelId },
-                    { name: "Direction", type: sql.VarChar(10), value: call.direction || "UNKNOWN" },
+                    { name: "Direction", type: sql.VarChar(10), value: call.direction || "INTERNAL" },
                     { name: "Ani", type: sql.VarChar(32), value: call.ani ?? "UNKNOWN" },
                     { name: "Dnis", type: sql.VarChar(32), value: call.dnis ?? "UNKNOWN" },
                     { name: "State", type: sql.VarChar(20), value: call.state },
@@ -64,7 +64,7 @@ const PORT = process.env.WATCHER_PORT || 3005;
                 await execSP("usp_ActiveCalls_Upsert", [
                     { name: "ChannelId", type: sql.VarChar(64), value: call.channelId },
                     { name: "LinkedId", type: sql.VarChar(64), value: call.linkedId || call.channelId },
-                    { name: "Direction", type: sql.VarChar(10), value: call.direction || "UNKNOWN" },
+                    { name: "Direction", type: sql.VarChar(10), value: call.direction || "INTERNAL" },
                     { name: "Ani", type: sql.VarChar(32), value: call.ani || null },
                     { name: "Dnis", type: sql.VarChar(32), value: call.dnis || null },
                     { name: "State", type: sql.VarChar(20), value: call.state },
@@ -80,7 +80,7 @@ const PORT = process.env.WATCHER_PORT || 3005;
                     await execSP("usp_ActiveCalls_Upsert", [
                         { name: "ChannelId", type: sql.VarChar(64), value: call.linkedId },
                         { name: "LinkedId", type: sql.VarChar(64), value: call.channelId },
-                        { name: "Direction", type: sql.VarChar(10), value: call.direction || "UNKNOWN" },
+                        { name: "Direction", type: sql.VarChar(10), value: call.direction || "INTERNAL" },
                         { name: "Ani", type: sql.VarChar(32), value: call.ani || null },
                         { name: "Dnis", type: sql.VarChar(32), value: call.dnis || null },
                         { name: "State", type: sql.VarChar(20), value: call.state },
@@ -111,64 +111,11 @@ const PORT = process.env.WATCHER_PORT || 3005;
             }
         });
 
-        // --- CALL REJECTED (Reglas de negocio) ---
-        await subscriber.subscribe("call.rejected", async (message) => {
-            try {
-                const call = JSON.parse(message);
-                log("info", `🚫 CALL REJECTED ${call.ani} → ${call.dnis}: ${call.reason}`);
-
-                // Registrar en CallLogs con estado específico
-                await execSP("usp_CallLogs_InsertFromActive", [
-                    { name: "ChannelId", type: sql.VarChar(64), value: call.channelId },
-                    { name: "Status", type: sql.VarChar(32), value: "REJECTED" }
-                ]);
-
-                // Limpiar cache Redis
-                await redis.del(`activeCall:${call.channelId}`);
-
-                // Estado del agente (disponible)
-                if (call.ani) {
-                    await execSP("usp_AgentRuntime_UpsertByExtension", [
-                        { name: "Extension", type: sql.VarChar(10), value: call.ani },
-                        { name: "NewStatus", type: sql.VarChar(20), value: "AVAILABLE" },
-                        { name: "Event", type: sql.VarChar(50), value: `call.rejected:${call.reason}` },
-                        { name: "ChannelId", type: sql.VarChar(64), value: call.channelId },
-                    ]);
-                    log("info", `📞 Extensión ${call.ani} marcada como AVAILABLE (rejected: ${call.reason})`);
-                }
-
-            } catch (err) {
-                log("error", "❌ Error en call.rejected", err);
-            }
-        });
-
         // --- HANGUP ---
         await subscriber.subscribe("call.hangup", async (message) => {
             try {
                 const call = JSON.parse(message);
                 log("info", `🔴 HANGUP ${call.channelId}`);
-
-                // --- Bloque de grabación (si se incluye recordingPath) ---
-                if (call.recordingPath) {
-                    try {
-                        log("info", `🎧 Grabación disponible para ${call.channelId}: ${call.recordingPath}`);
-
-                        // 1️⃣ Actualizar registro activo con la ruta
-                        await execSP("usp_ActiveCalls_UpdateRecordingPath", [
-                            { name: "ChannelId", type: sql.VarChar(64), value: call.channelId },
-                            { name: "RecordingPath", type: sql.NVarChar(1024), value: call.recordingPath },
-                        ]);
-
-                        // 2️⃣ (opcional) actualizar directamente en CallLogs si existe
-                        await execSP("usp_CallLogs_UpdateRecordingPath", [
-                            { name: "ChannelId", type: sql.VarChar(64), value: call.channelId },
-                            { name: "RecordingPath", type: sql.NVarChar(1024), value: call.recordingPath },
-                        ]);
-
-                    } catch (err) {
-                        log("warn", "No se pudo actualizar RecordingPath en SQL", err.message);
-                    }
-                }
 
                 // 1️⃣ Registrar en CallLogs
                 await execSP("usp_CallLogs_InsertFromActive", [
