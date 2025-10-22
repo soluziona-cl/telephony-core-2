@@ -80,7 +80,6 @@ const PORT = process.env.WATCHER_PORT || 3005;
         });
 
         // --- HANGUP ---
-        // --- HANGUP ---
         await subscriber.subscribe("call.hangup", async (message) => {
             try {
                 const call = JSON.parse(message);

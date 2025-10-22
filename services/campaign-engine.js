@@ -18,7 +18,9 @@ setInterval(async () => {
 }, 15000);
 
 // eventos de Redis
-await redis.subscribe("call.hangup", async (msg) => {
+redis.subscribe("call.hangup", async (msg) => {
     const data = JSON.parse(msg);
     log("info", `☎️ Llamada finalizada detectada por Campaign Engine`, data);
+}).catch(err => {
+    log("error", "Error subscribing to Redis events", err.message);
 });
