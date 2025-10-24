@@ -44,10 +44,12 @@ const PORT = process.env.WATCHER_PORT || 3005;
 
                 await redis.set(`activeCall:${call.channelId}`, JSON.stringify(call), { EX: 600 });
 
-                // 🔄 Estado del agente (SP)
-                await execSP("usp_AgentStatus_ChangeByExtension", [
+                // ✅ Estado del agente (SP UNIFICADO)
+                await execSP("usp_AgentStatus_SyncByExtension", [
                     { name: "Extension", type: sql.VarChar(10), value: call.ani },
-                    { name: "NewStatus", type: sql.VarChar(20), value: "RINGING" }
+                    { name: "NewStatus", type: sql.VarChar(20), value: "RINGING" },
+                    { name: "Event", type: sql.VarChar(50), value: "call.ringing" },
+                    { name: "ChannelId", type: sql.VarChar(64), value: call.channelId }
                 ]);
             } catch (err) {
                 log("error", "❌ Error en call.ringing", err);
@@ -91,19 +93,13 @@ const PORT = process.env.WATCHER_PORT || 3005;
                     ]);
                 }
 
-                // Estado del agente
+                // ✅ Estado del agente cuando conecta (SP UNIFICADO)
                 if (call.state === "Up") {
-                    await execSP("usp_AgentStatus_ChangeByExtension", [
-                        { name: "Extension", type: sql.VarChar(10), value: call.ani },
-                        { name: "NewStatus", type: sql.VarChar(20), value: "IN_CALL" }
-                    ]);
-
-                    // 🔄 Actualizar también AgentRuntimeStatus
-                    await execSP("usp_AgentRuntime_UpsertByExtension", [
+                    await execSP("usp_AgentStatus_SyncByExtension", [
                         { name: "Extension", type: sql.VarChar(10), value: call.ani },
                         { name: "NewStatus", type: sql.VarChar(20), value: "IN_CALL" },
                         { name: "Event", type: sql.VarChar(50), value: "call.state:Up" },
-                        { name: "ChannelId", type: sql.VarChar(64), value: call.channelId },
+                        { name: "ChannelId", type: sql.VarChar(64), value: call.channelId }
                     ]);
                 }
             } catch (err) {
@@ -126,13 +122,13 @@ const PORT = process.env.WATCHER_PORT || 3005;
                 // Limpiar cache Redis
                 await redis.del(`activeCall:${call.channelId}`);
 
-                // Estado del agente (disponible)
+                // ✅ Estado del agente (SP UNIFICADO)
                 if (call.ani) {
-                    await execSP("usp_AgentRuntime_UpsertByExtension", [
+                    await execSP("usp_AgentStatus_SyncByExtension", [
                         { name: "Extension", type: sql.VarChar(10), value: call.ani },
                         { name: "NewStatus", type: sql.VarChar(20), value: "AVAILABLE" },
                         { name: "Event", type: sql.VarChar(50), value: `call.rejected:${call.reason}` },
-                        { name: "ChannelId", type: sql.VarChar(64), value: call.channelId },
+                        { name: "ChannelId", type: sql.VarChar(64), value: call.channelId }
                     ]);
                     log("info", `📞 Extensión ${call.ani} marcada como AVAILABLE (rejected: ${call.reason})`);
                 }
@@ -179,31 +175,13 @@ const PORT = process.env.WATCHER_PORT || 3005;
                 // 2️⃣ Eliminar de cache Redis
                 await redis.del(`activeCall:${call.channelId}`);
 
-                // 3️⃣ Recuperar AgentId si existe
-                const pool = await poolPromise;
-                const result = await pool.request()
-                    .input("ChannelId", sql.VarChar(64), call.channelId)
-                    .query("SELECT TOP 1 AgentId FROM ActiveCalls WHERE ChannelId = @ChannelId");
+                // ✅ 3️⃣ USAR SP UNIFICADO PARA HANGUP
+                await execSP("usp_AgentStatus_SyncOnHangup", [
+                    { name: "AgentId", type: sql.Int, value: call.agentId || null },
+                    { name: "AgentExtension", type: sql.VarChar(10), value: call.ani || null }
+                ]);
 
-                const agentId = result.recordset?.[0]?.AgentId || null;
-
-                // 4️⃣ Actualizar estado del agente (disponible)
-                if (agentId) {
-                    await execSP("usp_AgentStatus_Change", [
-                        { name: "AgentId", type: sql.Int, value: agentId },
-                        { name: "NewStatus", type: sql.VarChar(20), value: "AVAILABLE" }
-                    ]);
-                    log("info", `👤 Agente ${agentId} marcado como AVAILABLE`);
-                } else if (call.ani) {
-                    await execSP("usp_AgentRuntime_UpsertByExtension", [
-                        { name: "Extension", type: sql.VarChar(10), value: call.ani },
-                        { name: "NewStatus", type: sql.VarChar(20), value: "AVAILABLE" },
-                        { name: "Event", type: sql.VarChar(50), value: "call.hangup" },
-                        { name: "ChannelId", type: sql.VarChar(64), value: call.channelId },
-                    ]);
-
-                    log("info", `📞 Extensión ${call.ani} marcada como AVAILABLE`);
-                }
+                log("info", `✅ Estado del agente sincronizado a AVAILABLE (ChannelId: ${call.channelId})`);
 
             } catch (err) {
                 log("error", "❌ Error en call.hangup", err);
@@ -222,6 +200,39 @@ const PORT = process.env.WATCHER_PORT || 3005;
 // --- ENDPOINT STATUS ---
 app.get("/status", (req, res) => {
     res.json({ service: "telephony-watcher", status: "ok", timestamp: new Date().toISOString() });
+});
+
+// --- ENDPOINT DIAGNOSTICS ---
+app.get("/diagnostics", async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request().execute("usp_AgentStatus_DiagnosticReport");
+        
+        res.json({
+            service: "telephony-watcher",
+            timestamp: new Date().toISOString(),
+            agents: result.recordsets[0],
+            summary: result.recordsets[1][0]
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- ENDPOINT SYNC ORPHANS ---
+app.post("/sync-orphans", async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        await pool.request().execute("usp_AgentStatus_SyncOrphans");
+        
+        res.json({
+            success: true,
+            message: "Sincronización de agentes huérfanos completada",
+            timestamp: new Date().toISOString()
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.listen(PORT, () => log("info", `📡 Telephony Watcher activo en puerto ${PORT}`));

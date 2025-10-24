@@ -1,3 +1,4 @@
+
 import AriClient from "ari-client";
 import { sql, poolPromise } from "../lib/db.js";
 import redis from "../lib/redis.js";
@@ -33,6 +34,105 @@ function mapAsteriskStateToReason(state) {
     case "Failed": return "no-route";
     case "Down": return "failed";
     default: return "unknown";
+  }
+}
+
+// ------------------------------------------------------
+// 👤 Funciones para gestión de estado de agentes
+// ------------------------------------------------------
+async function updateAgentStatus(agentId, status, channelId = null, linkedId = null) {
+  try {
+    const payload = {
+      agentId,
+      status,
+      channelId,
+      linkedId,
+      timestamp: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    // Guardar en Redis
+    await setJson(`agent:${agentId}`, payload, 3600);
+    
+    // Publicar evento
+    await redis.publish('agent.status', JSON.stringify(payload));
+    
+    log("info", `👤 Estado de agente ${agentId} actualizado a: ${status}`);
+  } catch (error) {
+    log("error", `Error actualizando estado del agente ${agentId}`, error.message);
+  }
+}
+
+async function getAgentByChannel(channelId) {
+  try {
+    // Buscar agente por canal en diferentes ubicaciones
+    const keys = await redis.keys(`agent:*:channel:${channelId}`);
+    if (keys.length > 0) {
+      const agentData = await getJson(keys[0]);
+      return agentData;
+    }
+    
+    // Buscar en activeCall
+    const callData = await getJson(`activeCall:${channelId}`);
+    if (callData && callData.agentId) {
+      return { agentId: callData.agentId };
+    }
+    
+    return null;
+  } catch (error) {
+    log("warn", `Error buscando agente por canal ${channelId}`, error.message);
+    return null;
+  }
+}
+
+async function detectAgentFromChannel(channel) {
+  try {
+    // Método 1: Extraer del nombre del canal (PJSIP/1001-00000001 → 1001)
+    const channelName = channel.name || '';
+    const agentMatch = channelName.match(/PJSIP\/(\d+)-/);
+    if (agentMatch) {
+      log("debug", `🔍 Agente detectado por nombre de canal: ${agentMatch[1]}`);
+      return agentMatch[1];
+    }
+    
+    // Método 2: Buscar en variables del canal
+    const variables = channel.variables || {};
+    if (variables.AGENT_ID) {
+      log("debug", `🔍 Agente detectado por variable AGENT_ID: ${variables.AGENT_ID}`);
+      return variables.AGENT_ID;
+    }
+    
+    // Método 3: Para llamadas OUTBOUND, el ANI es el agente
+    const direction = detectDirection(channel);
+    if (direction === "OUTBOUND") {
+      const ani = channel?.caller?.number;
+      if (ani && ani.length <= 4) {
+        log("debug", `🔍 Agente detectado por ANI outbound: ${ani}`);
+        return ani;
+      }
+    }
+    
+    // Método 4: Para llamadas INBOUND, el DNIS podría ser la extensión del agente
+    if (direction === "INBOUND") {
+      const dnis = channel.dialplan?.exten;
+      if (dnis && dnis.length <= 4) { // Asumiendo extensiones cortas
+        log("debug", `🔍 Agente detectado por DNIS inbound: ${dnis}`);
+        return dnis;
+      }
+    }
+    
+    // Método 5: DNIS genérico (fallback)
+    const dnis = channel.dialplan?.exten;
+    if (dnis && dnis.length <= 4) {
+      log("debug", `🔍 Agente detectado por DNIS genérico: ${dnis}`);
+      return dnis;
+    }
+    
+    log("debug", `🔍 No se pudo detectar agente para canal ${channel.id} (direction: ${direction})`);
+    return null;
+  } catch (error) {
+    log("warn", "Error detectando agente desde canal", error.message);
+    return null;
   }
 }
 
@@ -172,7 +272,7 @@ async function releaseLock(lockKey, lockValue) {
       return 0
     end
   `;
-  
+
   try {
     // ✅ CORRECCIÓN: Usar formato correcto de @redis/client
     return await redis.eval(script, {
@@ -185,143 +285,25 @@ async function releaseLock(lockKey, lockValue) {
     try {
       await redis.del(lockKey);
       log("warn", `Lock ${lockKey} eliminado por fallback (no atómico)`);
-    } catch {}
+    } catch { }
     return 0;
   }
 }
 
 // ------------------------------------------------------
-// 🎯 Sistema de Detección Multinivel de Canales Relacionados
-// ------------------------------------------------------
-/**
- * 🎯 Detecta y fuerza hangup de canales relacionados usando múltiples métodos
- * @param {Object} ari - Cliente ARI
- * @param {string} linkedId - LinkedId de la llamada
- * @param {string} culpritId - ChannelId del canal que inició el hangup
- * @param {string} reason - Razón del hangup
- * @returns {Promise<string[]>} - Array de channelIds colgados
- */
-async function findAndHangupRelatedChannels(ari, linkedId, culpritId, reason = "cancelled-by-origin") {
-  const relatedChannels = [];
-  const hangupPromises = [];
-
-  try {
-    // 🥇 NIVEL 1: RELACIÓN EXPLÍCITA A↔B (MÁS CONFIABLE)
-    const bLegId = await redis.get(`aleg:${culpritId}:bleg`);
-    const aLegId = await redis.get(`bleg:${culpritId}:aleg`);
-    
-    if (bLegId) {
-      log("info", `🎯 Nivel 1: B-leg encontrado via relación explícita: ${bLegId}`);
-      relatedChannels.push({ id: bLegId, source: "explicit-relation" });
-    }
-    
-    if (aLegId) {
-      log("info", `🎯 Nivel 1: A-leg encontrado via relación explícita: ${aLegId}`);
-      relatedChannels.push({ id: aLegId, source: "explicit-relation" });
-    }
-
-    // 🥈 NIVEL 2: BÚSQUEDA POR BRIDGE (PARA CANALES EN BRIDGE)
-    if (relatedChannels.length === 0) {
-      const bridgeId = await redis.get(`bridge:${linkedId}`);
-      if (bridgeId) {
-        try {
-          const bridge = ari.Bridge();
-          bridge.id = bridgeId;
-          const info = await bridge.get();
-          
-          if (Array.isArray(info.channels)) {
-            const bridgeChannels = info.channels.filter(chId => chId !== culpritId);
-            log("info", `🎯 Nivel 2: ${bridgeChannels.length} canal(es) encontrado(s) en bridge ${bridgeId}`);
-            
-            for (const chId of bridgeChannels) {
-              relatedChannels.push({ id: chId, source: "bridge" });
-            }
-          }
-        } catch (err) {
-          if (!err.message.includes("not found")) {
-            log("warn", `No se pudo acceder al bridge ${bridgeId}:`, err.message);
-          }
-        }
-      }
-    }
-
-    // 🥉 NIVEL 3: BÚSQUEDA POR LINKEDID (FALLBACK LEGACY)
-    if (relatedChannels.length === 0) {
-      log("warn", `⚠️ Nivel 3: Fallback a búsqueda por linkedId para ${linkedId}`);
-      try {
-        const chans = await ari.channels.list();
-        const linkedChans = chans.filter(ch => 
-          (ch.linkedid === linkedId || ch.id === linkedId) && ch.id !== culpritId
-        );
-        
-        for (const ch of linkedChans) {
-          log("info", `🎯 Nivel 3: Canal encontrado por linkedId: ${ch.id}`);
-          relatedChannels.push({ id: ch.id, source: "linkedid" });
-        }
-      } catch (err) {
-        log("error", "Error listando canales en Nivel 3", err.message);
-      }
-    }
-
-    // 🔨 EJECUTAR HANGUP DE TODOS LOS CANALES ENCONTRADOS
-    for (const { id: chId, source } of relatedChannels) {
-      log("info", `🧩 Forzando hangup de canal ${chId} (${reason}) [fuente: ${source}]`);
-      
-      hangupPromises.push(
-        ari.channels.hangup({ channelId: chId })
-          .then(() => {
-            log("info", `✅ Hangup exitoso: ${chId}`);
-            return chId;
-          })
-          .catch(err => {
-            if (!err.message.includes("No such channel") && !err.message.includes("not found")) {
-              log("warn", `⚠️ Error colgando canal ${chId}:`, err.message);
-            }
-            return chId; // Retornar de todas formas para publicar evento
-          })
-      );
-
-      // Publicar evento de hangup
-      await publishHangupOnce({ id: chId }, {
-        channelId: chId,
-        linkedId,
-        ani: "",
-        dnis: "",
-        direction: "UNKNOWN",
-        reason,
-        endedAt: new Date().toISOString(),
-      });
-
-      // Marcar como procesado
-      await redis.setEx(`hangup:${chId}`, 15, "1");
-    }
-
-    // Esperar a que todos los hangups terminen
-    const hungUpChannels = await Promise.all(hangupPromises);
-    
-    if (relatedChannels.length === 0) {
-      log("warn", `⚠️ No se encontraron canales relacionados para ${linkedId} (culprit: ${culpritId})`);
-    } else {
-      log("info", `✅ ${relatedChannels.length} canal(es) procesado(s) para hangup`);
-    }
-
-    return hungUpChannels;
-
-  } catch (err) {
-    log("error", "Error en findAndHangupRelatedChannels", err.message);
-    return [];
-  }
-}
-
-// ------------------------------------------------------
-// 🧹 Limpieza y colgado cruzado
+// 🧹 Limpieza y colgado cruzado MEJORADA
 // ------------------------------------------------------
 async function hangupOriginAndCleanup(ari, linkedId, culpritChannelId) {
+  if (!linkedId) {
+    log("warn", "🧹 linkedId undefined - saltando limpieza");
+    return;
+  }
+
   const lockKey = `cleanup:${linkedId}`;
   let lockValue = null;
   
   try {
-    lockValue = await acquireLock(lockKey, 15);
+    lockValue = await acquireLock(lockKey, 30); // Aumentar TTL a 30 segundos
     if (!lockValue) {
       log("debug", `🧹 Limpieza ya en progreso para ${linkedId} - saltando`);
       return;
@@ -329,53 +311,70 @@ async function hangupOriginAndCleanup(ari, linkedId, culpritChannelId) {
 
     log("info", `🧹 Iniciando limpieza para linkedId=${linkedId}, culprit=${culpritChannelId}`);
 
-    // 🎯 USAR SISTEMA MULTINIVEL PARA ENCONTRAR CANALES
-    const relatedChannels = await findAndHangupRelatedChannels(ari, linkedId, culpritChannelId, "cleanup");
-
-    // 💥 DESTRUIR BRIDGE SI EXISTE
+    // 🔄 1. Obtener bridgeId primero
     const bridgeId = await redis.get(`bridge:${linkedId}`);
+    
+    // 🔄 2. Limpiar referencias de agentes
+    try {
+      const chans = await ari.channels.list();
+      const relatedChannels = chans.filter(ch => 
+        ch.linkedid === linkedId || ch.id === culpritChannelId
+      );
+
+      for (const ch of relatedChannels) {
+        await redis.del(`agent:channel:${ch.id}`);
+        log("debug", `🧹 Referencia Redis limpiada para canal ${ch.id}`);
+      }
+    } catch (agentErr) {
+      log("warn", "Error limpiando referencias Redis", agentErr.message);
+    }
+
+    // 🔄 3. Destruir bridge si existe
     if (bridgeId) {
       try {
-        const b = ari.Bridge();
-        b.id = bridgeId;
-        await b.destroy();
+        const bridge = ari.Bridge();
+        bridge.id = bridgeId;
+        await bridge.destroy();
         log("info", `💥 Bridge ${bridgeId} destruido`);
       } catch (err) {
         if (!err.message.includes("not found")) {
-          log("debug", `Bridge ${bridgeId} ya destruido:`, err.message);
+          log("warn", `Error destruyendo bridge ${bridgeId}:`, err.message);
         }
       }
     }
 
-    // 🧹 LIMPIEZA DE REDIS (extendida)
+    // 🔄 4. Limpiar Redis
     const keysToDelete = [
-      `bridge:${linkedId}`,
       `activeLinked:${linkedId}`,
       `channels:${linkedId}`,
-      `aleg:${linkedId}`,
-      `bridgeToLinked:${bridgeId}`,
+      `bridge:${linkedId}`,
+      `linkedId:${bridgeId}`,
+      `recording:${linkedId}`,
+      `recordingPath:${linkedId}`
     ];
 
-    // Limpiar relaciones A↔B de los canales procesados
-    for (const chId of [culpritChannelId, ...relatedChannels]) {
-      keysToDelete.push(`aleg:${chId}:bleg`);
-      keysToDelete.push(`bleg:${chId}:aleg`);
-    }
-
-    // Limpiar activeCall:* del linkedId
-    const activeCallKeys = await redis.keys(`activeCall:*`);
-    for (const key of activeCallKeys) {
-      const data = await redis.get(key);
-      if (data && data.includes(linkedId)) {
-        keysToDelete.push(key);
+    for (const key of keysToDelete) {
+      try {
+        await redis.del(key);
+      } catch (e) {
+        // Ignorar errores de eliminación
       }
     }
 
-    // Ejecutar limpieza en batch
-    if (keysToDelete.length > 0) {
-      await Promise.all(keysToDelete.map(key => redis.del(key).catch(() => {})));
-      log("info", `🧹 Limpieza Redis: ${keysToDelete.length} keys eliminadas`);
+    // 🔄 5. Limpiar activeCall relacionados
+    try {
+      const activeCallKeys = await redis.keys(`activeCall:*`);
+      for (const key of activeCallKeys) {
+        const data = await getJson(key);
+        if (data && data.linkedId === linkedId) {
+          await redis.del(key);
+        }
+      }
+    } catch (e) {
+      log("warn", "Error limpiando activeCall keys", e.message);
     }
+
+    log("info", `🧹 Limpieza completada para ${linkedId}`);
 
   } catch (e) {
     log("error", "hangupOriginAndCleanup error", e.message);
@@ -452,7 +451,7 @@ AriClient.connect(
                 linkedId,
                 timestamp: new Date().toISOString(),
               });
-              
+
               // ✅ NUEVO: Publicar evento específico de rechazo
               await publish(channel, "call.rejected", {
                 channelId: channel.id,
@@ -463,7 +462,7 @@ AriClient.connect(
                 direction: detectDirection(channel),
                 endedAt: new Date().toISOString(),
               });
-              
+
               // ✅ CORRECCIÓN: Colgar directo sin audio para evitar race condition
               try {
                 await channel.hangup();
@@ -484,7 +483,7 @@ AriClient.connect(
                 linkedId,
                 timestamp: new Date().toISOString(),
               });
-              
+
               // ✅ NUEVO: Publicar evento específico de rechazo
               await publish(channel, "call.rejected", {
                 channelId: channel.id,
@@ -495,7 +494,7 @@ AriClient.connect(
                 direction: detectDirection(channel),
                 endedAt: new Date().toISOString(),
               });
-              
+
               // ✅ CORRECCIÓN: Colgar directo sin audio para evitar race condition
               try {
                 await channel.hangup();
@@ -530,16 +529,13 @@ AriClient.connect(
           const bridge = await ensureBridge(ari, bridgeId);
           await bridge.addChannel({ channel: channel.id });
 
-          // 🆕 NIVEL 1: Guardar A-leg en Redis ANTES de originate
+          // 🧩 Guardar referencia en Redis para seguimiento
           await redis.set(`bridge:${linkedId}`, bridgeId, { EX: 3600 });
           await redis.set(`activeLinked:${linkedId}`, bridgeId, { EX: 3600 });
           await setJson(`channels:${linkedId}`, { a: channel.id }, 3600);
           
-          // 🆕 MAPEO INVERSO: bridgeId → linkedId (para búsqueda por bridge)
-          await redis.set(`bridgeToLinked:${bridgeId}`, linkedId, { EX: 3600 });
-          
-          // 🆕 MAPEO A-LEG: linkedId → A-leg channelId
-          await redis.set(`aleg:${linkedId}`, channel.id, { EX: 3600 });
+          // 🆕 FORZAR linkedId consistente para el B-leg
+          await redis.set(`linkedId:${bridgeId}`, linkedId, { EX: 3600 });
 
           // 📡 Publicar evento de inicio de llamada (ringing)
           await publish(channel, "call.ringing", {
@@ -571,9 +567,9 @@ AriClient.connect(
               try {
                 const chans = await ari.channels.list();
                 const linkedChans = chans.filter(ch => (ch.linkedid || ch.id) === linkedId);
-                
+
                 if (linkedChans.length === 0) return; // ya se limpió
-                
+
                 // ✅ Solo timeout si NINGÚN canal llegó a "Up"
                 const anyConnected = linkedChans.some(ch => ch.state === "Up");
                 if (anyConnected) {
@@ -585,16 +581,18 @@ AriClient.connect(
 
                 // Publica "timeout" para ambos extremos que sigan vivos
                 for (const ch of linkedChans) {
+                  const chAgentId = await detectAgentFromChannel(ch);
                   await publishHangupOnce(ch, {
                     channelId: ch.id,
                     linkedId,
                     ani: ch?.caller?.number || "",
                     dnis: ch?.dialplan?.exten || "",
                     reason: "timeout",
+                    agentId: chAgentId || null,
                     direction: detectDirection(ch),
                     endedAt: new Date().toISOString(),
                   });
-                  try { await ari.channels.hangup({ channelId: ch.id }); } catch {}
+                  try { await ari.channels.hangup({ channelId: ch.id }); } catch { }
                 }
                 await hangupOriginAndCleanup(ari, linkedId, channel.id);
               } catch (e) {
@@ -620,35 +618,18 @@ AriClient.connect(
           await channel.answer().catch(() => { });
           await bridge.addChannel({ channel: channel.id });
           
-          // 🆕 NIVEL 1: Obtener linkedId del bridge mapping
-          const linkedId = await redis.get(`bridgeToLinked:${bridgeId}`) || channel.linkedid || channel.id;
+          // 🆕 OBTENER linkedId del bridge en lugar del canal
+          const bridgeLinkedId = await redis.get(`linkedId:${bridgeId}`) || channel.linkedid || channel.id;
           
-          log("info", `🔗 Canal ${channel.id} (${ani} → ${dnis}) unido a bridge ${bridgeId} [linkedId: ${linkedId}]`);
+          log("info", `🔗 Canal ${channel.id} (${ani} → ${dnis}) unido a bridge ${bridgeId} [linkedId: ${bridgeLinkedId}]`);
 
-          // 🆕 COMPLETAR RELACIÓN A↔B
-          const aLegId = await redis.get(`aleg:${linkedId}`);
-          if (aLegId) {
-            // Guardar relación bidireccional
-            await redis.set(`aleg:${aLegId}:bleg`, channel.id, { EX: 600 });
-            await redis.set(`bleg:${channel.id}:aleg`, aLegId, { EX: 600 });
-            
-            // Guardar en estructura de canales
-            const chMap = (await getJson(`channels:${linkedId}`)) || {};
-            chMap.b = channel.id;
-            await setJson(`channels:${linkedId}`, chMap, 3600);
-            
-            log("info", `🔗 Relación establecida: A-leg=${aLegId} ↔ B-leg=${channel.id}`);
-          } else {
-            log("warn", `⚠️ No se encontró A-leg para linkedId ${linkedId}`);
-          }
-
-          // Actualizar bridge mapping
-          await redis.set(`bridge:${linkedId}`, bridgeId, { EX: 600 });
+          // 🆕 USAR linkedId consistente
+          await redis.set(`bridge:${bridgeLinkedId}`, bridgeId, { EX: 600 });
 
           // 📡 Publicar estado de llamada para el B-leg
           await publish(channel, "call.state", {
             channelId: channel.id,
-            linkedId,
+            linkedId: bridgeLinkedId, // 🆕 Usar linkedId consistente
             ani,
             dnis,
             state: "Up",
@@ -667,26 +648,51 @@ AriClient.connect(
     ari.on("ChannelStateChange", async (event, channel) => {
       try {
         const linkedId = channel.linkedid || channel.id;
+        const bridgeId = await redis.get(`bridge:${linkedId}`);
+        
+        log("debug", `🔍 ChannelStateChange: ${channel.id}, linkedId: ${linkedId}, bridge: ${bridgeId}, state: ${channel.state}`);
+        
         const ani = channel?.caller?.number || "";
         const dnis = channel?.dialplan?.exten || "";
         const state = channel.state;
 
-        await setJson(`activeCall:${channel.id}`, {
+        // 🆕 DETECTAR AGENTE
+        const agentId = await detectAgentFromChannel(channel);
+        
+        const callData = {
           channelId: channel.id,
           linkedId,
           ani,
           dnis,
           state,
+          agentId: agentId || null,
           lastUpdate: new Date().toISOString(),
-        });
+        };
+
+        await setJson(`activeCall:${channel.id}`, callData);
 
         if (state === "Ringing") {
           log("info", `🔔 Canal ${channel.id} (${ani} → ${dnis}) en Ringing`);
+          
+          // 🆕 ACTUALIZAR AGENTE A "RINGING"
+          if (agentId) {
+            await updateAgentStatus(agentId, "ringing", channel.id, linkedId);
+          }
         } else if (state === "Up") {
-          // 🧩 --- 1️⃣ Dirección dinámica ---
           const direction = detectDirection(channel);
 
           log("info", `🔗 Canal ${channel.id} (${ani} → ${dnis}) conectado [${direction}]`);
+
+          // --- 🔒 FIX: normalizar "s" en destino ---
+          if (!dnis || dnis.toLowerCase() === "s" || dnis.toLowerCase() === "null") {
+            dnis = channel?.connected?.number || channel?.caller?.number || "";
+          }
+          if (!ani || ani.toLowerCase() === "s" || ani.toLowerCase() === "null") {
+            ani = channel?.caller?.number || channel?.connected?.number || "";
+          }
+          ani = ani.replace(/[^0-9+]/g, "");
+          dnis = dnis.replace(/[^0-9+]/g, "");
+          // --- FIN FIX ---
 
           // 📡 --- Publicar evento de estado ---
           await publish(channel, "call.state", {
@@ -696,18 +702,21 @@ AriClient.connect(
             dnis,
             state: "Up",
             direction,
+            agentId: agentId || null,
             startedAt: new Date().toISOString(),
           });
 
           // 🟢 --- Actualizar Redis ---
-          await redis.set(`activeCall:${channel.id}`, JSON.stringify({
-            channelId: channel.id,
-            ani,
-            dnis,
-            state: "Up",
-            linkedId,
-            direction,
-          }), { EX: 600 });
+          callData.direction = direction;
+          await setJson(`activeCall:${channel.id}`, callData);
+
+          // 🆕 ACTUALIZAR AGENTE A "IN-CALL"
+          if (agentId) {
+            await updateAgentStatus(agentId, "in-call", channel.id, linkedId);
+            
+            // Guardar referencia adicional para búsqueda rápida
+            await redis.set(`agent:channel:${channel.id}`, agentId, { EX: 3600 });
+          }
 
           // 🧩 --- Sincronizar canal hermano ---
           try {
@@ -716,6 +725,7 @@ AriClient.connect(
               if (ch.linkedid === linkedId && ch.id !== channel.id) {
                 const otherAni = ch.caller?.number || "";
                 const otherDnis = ch.dialplan?.exten || "";
+                const otherAgentId = await detectAgentFromChannel(ch);
 
                 log("info", `🔄 Sincronizando canal hermano ${ch.id} (${otherAni} → ${otherDnis})`);
 
@@ -726,17 +736,26 @@ AriClient.connect(
                   dnis: otherDnis,
                   state: "Up",
                   direction,
+                  agentId: otherAgentId || null,
                   startedAt: new Date().toISOString(),
                 });
 
-                await redis.set(`activeCall:${ch.id}`, JSON.stringify({
+                const otherCallData = {
                   channelId: ch.id,
                   ani: otherAni,
                   dnis: otherDnis,
                   state: "Up",
                   linkedId,
                   direction,
-                }), { EX: 600 });
+                  agentId: otherAgentId || null,
+                };
+                await setJson(`activeCall:${ch.id}`, otherCallData);
+
+                // 🆕 ACTUALIZAR AGENTE HERMANO SI EXISTE
+                if (otherAgentId) {
+                  await updateAgentStatus(otherAgentId, "in-call", ch.id, linkedId);
+                  await redis.set(`agent:channel:${ch.id}`, otherAgentId, { EX: 3600 });
+                }
               }
             }
           } catch (syncErr) {
@@ -746,28 +765,22 @@ AriClient.connect(
           // 🟣 --- 2️⃣ Iniciar grabación automática con fallback ---
           try {
             const recName = `${linkedId}_${ani}_${dnis}`.replace(/[^0-9A-Za-z_+]/g, "_");
-            if (typeof ari.recordings?.recordStored === "function") {
-              await ari.recordings.recordStored({
-                name: recName,
-                format: "wav",
-                target_uri: `channel:${channel.id}`,
-              });
-            } else {
-              // Fallback para clientes ARI donde solo existe `record`
-              await ari.recordings.record({
-                name: recName,
-                format: "wav",
-                target_uri: `channel:${channel.id}`,
-                ifExists: "overwrite",
-                beep: false,
-                maxDurationSeconds: 0,
-                maxSilenceSeconds: 0,
-              });
-            }
+            
+            // Usar recordStored que es más confiable
+            await ari.recordings.recordStored({
+              name: recName,
+              format: "wav",
+              maxDurationSeconds: 3600, // 1 hora máximo
+              maxSilenceSeconds: 10,
+              ifExists: "overwrite",
+              beep: false
+            });
+            
             await redis.set(`recording:${linkedId}`, recName, { EX: 3600 });
             log("info", `🎙️ Grabación iniciada (${recName}.wav)`);
           } catch (err) {
             log("warn", "No se pudo iniciar grabación", err.message);
+            // Continuar sin grabación
           }
 
           // ✅ --- Cancelar guard de timeout ---
@@ -784,12 +797,19 @@ AriClient.connect(
           const reason = mapAsteriskStateToReason(state);
           log("info", `❌ Canal ${channel.id} fallo de llamada (${state}) → reason=${reason}`);
 
+          // 🆕 SOLO LIMPIAR REFERENCIA REDIS EN CASO DE FALLO
+          if (agentId) {
+            await redis.del(`agent:channel:${channel.id}`);
+            log("debug", `🧹 Referencia Redis limpiada para agente ${agentId} (fallo)`);
+          }
+
           await publishHangupOnce(channel, {
             channelId: channel.id,
             linkedId,
             ani,
             dnis,
             reason,
+            agentId: agentId || null,
             direction: detectDirection(channel),
             endedAt: new Date().toISOString(),
           });
@@ -803,7 +823,7 @@ AriClient.connect(
     });
 
     // ------------------------------------------------------
-    // ☎️ ChannelHangupRequest — Sistema Multinivel con Detección de Roles
+    // ☎️ ChannelHangupRequest — detectar corte en Ringing y colgar destino al tiro
     // ------------------------------------------------------
     ari.on("ChannelHangupRequest", async (event, channel) => {
       try {
@@ -814,90 +834,76 @@ AriClient.connect(
         const snapshot = await getJson(stateKey);
         const st = snapshot?.state || channel.state;
 
-        // 🆕 DETECTAR ROL: A-leg o B-leg
-        const bLegId = await redis.get(`aleg:${channel.id}:bleg`);
-        const aLegId = await redis.get(`bleg:${channel.id}:aleg`);
-        
-        const isAleg = !!bLegId;
-        const isBleg = !!aLegId;
+        // 🆕 SOLO LIMPIAR REFERENCIA REDIS, NO ACTUALIZAR ESTADO
+        const agentId = await detectAgentFromChannel(channel);
+        log("debug", `📞 Hangup Request - Channel: ${channel.id}, Agent: ${agentId || 'N/A'}, State: ${st}`);
+        if (agentId) {
+          await redis.del(`agent:channel:${channel.id}`);
+          log("debug", `🧹 Referencia Redis limpiada para agente ${agentId} (hangup request)`);
+        }
 
-        log("info", `📞 ChannelHangupRequest: ${channel.id} (ANI: ${ani}, DNIS: ${dnis}, State: ${st}, Role: ${isAleg ? 'A-leg' : isBleg ? 'B-leg' : 'Unknown'})`);
+        // Caso especial: corte en RINGING => cancelar B-leg inmediato
+        if (st === "Ringing" || st === "Ring") {
+          log("info", `📞 ${ani} → ${dnis} cancelada ANTES de contestar (origen colgó)`);
 
-        // 🔴 CASO CRÍTICO: A-LEG CORTA (origen cancela)
-        if (isAleg) {
-          const reason = st === "Up" ? "caller-hangup" : "cancelled-before-answer";
-          log("info", `🚨 A-leg (${ani}) colgó → forzando limpieza [reason: ${reason}]`);
-
-          // Publicar hangup del A-leg
+          // Publica hangup origen
           await publishHangupOnce(channel, {
             channelId: channel.id,
             linkedId,
             ani,
             dnis,
-            reason,
+            reason: "cancelled-before-answer",
+            agentId: agentId || null,
             direction: detectDirection(channel),
             endedAt: new Date().toISOString(),
           });
 
-          // 🎯 FORZAR HANGUP MULTINIVEL
-          const lockKey = `forceHangup:${linkedId}`;
-          const lockValue = await acquireLock(lockKey, 10);
-          
-          if (lockValue) {
-            try {
-              await findAndHangupRelatedChannels(ari, linkedId, channel.id, reason);
-            } finally {
-              await releaseLock(lockKey, lockValue);
+          // Fuerza hangup del destino si existe
+          try {
+            const chans = await ari.channels.list();
+            for (const ch of chans) {
+              if (ch.linkedid === linkedId && ch.id !== channel.id) {
+                const otherAgentId = await detectAgentFromChannel(ch);
+                log("info", `🧩 Forzando hangup del destino (${ch.id}) en Ringing`);
+                try { await ari.channels.hangup({ channelId: ch.id }); } catch { }
+                
+                // 🆕 SOLO LIMPIAR REFERENCIA REDIS DEL AGENTE DESTINO
+                if (otherAgentId) {
+                  await redis.del(`agent:channel:${ch.id}`);
+                  log("debug", `🧹 Referencia Redis limpiada para agente destino ${otherAgentId}`);
+                }
+                
+                await publishHangupOnce(ch, {
+                  channelId: ch.id,
+                  linkedId,
+                  ani: ch?.caller?.number || ani || "",
+                  dnis: ch?.dialplan?.exten || dnis || "",
+                  reason: "cancelled-by-origin",
+                  agentId: otherAgentId || null,
+                  direction: detectDirection(ch),
+                  endedAt: new Date().toISOString(),
+                });
+              }
             }
+          } catch (e) {
+            log("warn", "No se pudo forzar hangup destino durante Ringing", e.message);
           }
 
           await hangupOriginAndCleanup(ari, linkedId, channel.id);
           return;
         }
 
-        // 🔵 CASO: B-LEG CORTA (destino rechaza)
-        if (isBleg) {
-          log("info", `📞 B-leg (${dnis}) rechazó/colgó → notificando A-leg`);
-          
-          await publishHangupOnce(channel, {
-            channelId: channel.id,
-            linkedId,
-            ani,
-            dnis,
-            reason: "hangup-request",
-            direction: detectDirection(channel),
-            endedAt: new Date().toISOString(),
-          });
-          
-          // No forzar hangup del A-leg, Asterisk lo maneja naturalmente
-          return;
-        }
-
-        // 🟡 CASO GENÉRICO: Canal sin relación explícita (fallback)
-        log("warn", `⚠️ Hangup de canal sin rol definido: ${channel.id}`);
-        
+        // Caso general: post-answered o cortes varios
         await publishHangupOnce(channel, {
           channelId: channel.id,
           linkedId,
           ani,
           dnis,
-          reason: st === "Ringing" || st === "Ring" ? "cancelled-before-answer" : "hangup-request",
+          reason: "hangup-request",
+          agentId: agentId || null,
           direction: detectDirection(channel),
           endedAt: new Date().toISOString(),
         });
-
-        // 🎯 Intentar limpieza multinivel de todas formas
-        const lockKey = `forceHangup:${linkedId}`;
-        const lockValue = await acquireLock(lockKey, 10);
-        
-        if (lockValue) {
-          try {
-            await findAndHangupRelatedChannels(ari, linkedId, channel.id, "hangup-request");
-          } finally {
-            await releaseLock(lockKey, lockValue);
-          }
-        }
-
       } catch (e) {
         log("error", "Error en ChannelHangupRequest", e.message);
       }
@@ -920,6 +926,14 @@ AriClient.connect(
         const stateKey = `activeCall:${channel.id}`;
         const lastState = (await getJson(stateKey))?.state || channel.state;
 
+        // 🆕 SOLO LIMPIAR REFERENCIA REDIS, NO ACTUALIZAR ESTADO
+        const agentId = await detectAgentFromChannel(channel);
+        log("debug", `📞 Channel Destroyed - Channel: ${channel.id}, Agent: ${agentId || 'N/A'}, State: ${lastState}`);
+        if (agentId) {
+          await redis.del(`agent:channel:${channel.id}`);
+          log("debug", `🧹 Referencia Redis limpiada para agente ${agentId} (channel destroyed)`);
+        }
+
         if (lastState === "Ringing" || lastState === "Ring") {
           log("info", `📞 ${ani} → ${dnis} cancelada antes de contestar`);
           await publish(channel, "call.cancelled", {
@@ -927,6 +941,7 @@ AriClient.connect(
             linkedId,
             ani,
             dnis,
+            agentId: agentId || null,
             cancelledAt: new Date().toISOString(),
           });
         }
@@ -938,8 +953,15 @@ AriClient.connect(
           const chans = await ari.channels.list();
           for (const ch of chans) {
             if (ch.caller?.number === ani && ch.id !== channel.id) {
+              const otherAgentId = await detectAgentFromChannel(ch);
               log("info", `🧩 Forzando hangup del A-leg huérfano (${ch.id}) de ${ani}`);
               try { await ari.channels.hangup({ channelId: ch.id }); } catch { }
+              
+              // 🆕 SOLO LIMPIAR REFERENCIA REDIS DEL AGENTE HUÉRFANO
+              if (otherAgentId) {
+                await redis.del(`agent:channel:${ch.id}`);
+                log("debug", `🧹 Referencia Redis limpiada para agente huérfano ${otherAgentId}`);
+              }
             }
           }
         } catch (err) {
@@ -980,6 +1002,7 @@ AriClient.connect(
               ani,
               dnis,
               reason: "channel-destroyed",
+              agentId: agentId || null,
               recordingPath: recordPath,
               direction: detectDirection(channel),
               endedAt: new Date().toISOString(),
@@ -992,6 +1015,7 @@ AriClient.connect(
               ani,
               dnis,
               reason: "channel-destroyed",
+              agentId: agentId || null,
               direction: detectDirection(channel),
               endedAt: new Date().toISOString(),
             });
@@ -1007,80 +1031,66 @@ AriClient.connect(
     });
 
     // ------------------------------------------------------
-    // 🧩 DETECTOR DE CORTE DEL ORIGEN (A-leg) - Mejorado con Detección Inmediata
+    // 🧩 DETECTOR DE CORTE DEL ORIGEN (A-leg)
     // ------------------------------------------------------
-    ari.on("ChannelLeftBridge", async (event, channel) => {
+    ari.on("ChannelLeftBridge", async (event, object) => {
       try {
+        // Verificar si el objeto es un canal
+        const channel = object.id ? object : null;
+        if (!channel) {
+          log("warn", "ChannelLeftBridge: objeto de canal no válido");
+          return;
+        }
+
         const { id, caller } = channel;
         const ani = caller?.number || "UNKNOWN";
         const bridgeId = event.bridge?.id;
         const linkedId = channel.linkedid || channel.id;
 
-        log("info", `👋 Canal salió del bridge ${bridgeId || '(sin bridge)'}: ${ani} (${id})`);
+        log("info", `👋 Canal ${id} (${ani}) salió del bridge ${bridgeId}`);
 
-        // 🆕 DETECTAR ROL
-        const bLegId = await redis.get(`aleg:${id}:bleg`);
-        const isAleg = !!bLegId;
-
-        // 🚨 SI ES A-LEG: Forzar hangup del B-leg INMEDIATAMENTE
-        if (isAleg && bLegId) {
-          log("info", `🚨 A-leg salió del bridge → forzando hangup inmediato de B-leg ${bLegId}`);
-          
-          try {
-            await ari.channels.hangup({ channelId: bLegId });
-            
-            await publishHangupOnce({ id: bLegId }, {
-              channelId: bLegId,
-              linkedId,
-              ani: "",
-              dnis: "",
-              reason: "cancelled-by-origin",
-              direction: "OUTBOUND",
-              endedAt: new Date().toISOString(),
-            });
-          } catch (err) {
-            if (!err.message.includes("No such channel")) {
-              log("warn", `Error forzando hangup de B-leg ${bLegId}:`, err.message);
-            }
-          }
+        // 🆕 SOLO LIMPIAR REFERENCIA REDIS, NO ACTUALIZAR ESTADO
+        const agentId = await detectAgentFromChannel(channel);
+        log("debug", `📞 Channel Left Bridge - Channel: ${channel.id}, Agent: ${agentId || 'N/A'}, Bridge: ${bridgeId}`);
+        if (agentId) {
+          await redis.del(`agent:channel:${channel.id}`);
+          log("debug", `🧹 Referencia Redis limpiada para agente ${agentId} (left bridge)`);
         }
 
-        // 🧹 Publicar fin del canal actual
+        // 🧹 Publicar fin del origen inmediatamente
         const key = `activeCall:${id}`;
         const callData = await redis.get(key);
         if (callData) {
           const parsed = JSON.parse(callData);
           parsed.state = 'Hangup';
-          parsed.reason = isAleg ? 'caller-hangup' : 'callee-hangup';
+          parsed.reason = 'caller-hangup';
+          parsed.agentId = agentId || null;
           parsed.endedAt = new Date().toISOString();
           await redis.publish('call.hangup', JSON.stringify(parsed));
           await redis.del(key);
         }
 
-        // 🧹 Limpieza completa
+        // 🧩 Forzar limpieza completa y corte del otro extremo
         await hangupOriginAndCleanup(ari, linkedId, id);
 
-        // 💥 Destruir bridge si existe
+        // 🩹 Adicional: destruir el bridge si quedó colgado
         if (bridgeId) {
           try {
             const b = ari.Bridge();
             b.id = bridgeId;
             await b.destroy();
-            log("info", `💥 Bridge ${bridgeId} destruido tras salida`);
+            log("info", `💥 Bridge ${bridgeId} destruido tras salida del origen`);
           } catch (err) {
-            if (!err.message.includes("not found")) {
-              log("debug", `Bridge ${bridgeId} ya destruido`);
-            }
+            log("warn", `No se pudo destruir bridge ${bridgeId}: ${err.message}`);
           }
         }
-
       } catch (err) {
-        log("error", "Error manejando ChannelLeftBridge", err);
+        log("error", "Error manejando ChannelLeftBridge (corte origen)", err);
       }
     });
 
     // ==========================================
-    // 🧩 BLOQUE FINAL — Corrección cortes cruzados
+    // 🧩 BLOQUE FINAL — Corrección cortes cruzados MEJORADA
     // ==========================================
     async function forceHangupPair(ari, linkedId, culpritId, reason = "cancelled-by-origin") {
       const lockKey = `forceHangup:${linkedId}`;
@@ -1092,30 +1102,61 @@ AriClient.connect(
       }
 
       try {
-        // Anti-doble: verificar si ya se procesó este hangup
-        if (await redis.exists(`hangup:${culpritId}`)) return;
-        
-        const chans = await ari.channels.list();
-        const related = chans.filter(c => c.linkedid === linkedId && c.id !== culpritId);
-        for (const ch of related) {
-          log("info", `🧩 Forzando hangup cruzado del canal ${ch.id} (${reason})`);
-          await ari.channels.hangup({ channelId: ch.id }).catch(()=>{});
-          await publishHangupOnce(ch, {
-            channelId: ch.id,
+        // 🆕 BUSCAR CANALES POR BRIDGE EN LUGAR DE LINKEDID
+        const bridgeId = await redis.get(`bridge:${linkedId}`);
+        let relatedChannels = [];
+
+        if (bridgeId) {
+          try {
+            const bridge = ari.Bridge();
+            bridge.id = bridgeId;
+            const info = await bridge.get();
+            if (Array.isArray(info.channels)) {
+              relatedChannels = info.channels.filter(chId => chId !== culpritId);
+            }
+          } catch (err) {
+            log("warn", `No se pudo obtener bridge ${bridgeId} para forceHangup`, err.message);
+          }
+        }
+
+        // 🆕 FALLBACK: buscar por linkedId si no hay bridge
+        if (relatedChannels.length === 0) {
+          const chans = await ari.channels.list();
+          relatedChannels = chans
+            .filter(c => c.linkedid === linkedId && c.id !== culpritId)
+            .map(c => c.id);
+        }
+
+        for (const chId of relatedChannels) {
+          log("info", `🧩 Forzando hangup cruzado del canal ${chId} (${reason})`);
+          
+          try {
+            await ari.channels.hangup({ channelId: chId });
+          } catch (err) {
+            if (!err.message.includes("No such channel")) {
+              log("warn", `Error colgando canal ${chId}:`, err.message);
+            }
+          }
+
+          // Intentar detectar agente del canal antes de publicar
+          const chAgentId = await detectAgentFromChannel({ id: chId });
+          await publishHangupOnce({ id: chId }, {
+            channelId: chId,
             linkedId,
-            ani: ch.caller?.number || "",
-            dnis: ch.dialplan?.exten || "",
-            direction: detectDirection(ch),
+            ani: "", // No tenemos info del canal
+            dnis: "",
+            direction: "UNKNOWN", 
             reason,
+            agentId: chAgentId || null,
             endedAt: new Date().toISOString(),
           });
-          // Marcar como procesado para evitar dobles
-          await redis.setEx(`hangup:${ch.id}`, 15, "1");
+
+          await redis.setEx(`hangup:${chId}`, 15, "1");
         }
+
       } catch (err) {
         log("warn", `Error en forceHangupPair(${linkedId})`, err.message);
       } finally {
-        // Liberar el lock
         await releaseLock(lockKey, lockValue);
       }
     }
@@ -1190,7 +1231,7 @@ AriClient.connect(
       try {
         const keys = await redis.keys("cleanup:*");
         const now = Date.now();
-        
+
         for (const key of keys) {
           const ttl = await redis.ttl(key);
           if (ttl === -1) { // Lock sin TTL (huérfano)
@@ -1198,7 +1239,7 @@ AriClient.connect(
             await redis.del(key);
           }
         }
-        
+
         if (keys.length > 0) {
           log("debug", `🧹 Orphan cleanup: ${keys.length} locks verificados`);
         }
@@ -1206,37 +1247,6 @@ AriClient.connect(
         log("error", "Error en orphan lock cleanup", err.message);
       }
     }, 300000); // cada 5 minutos
-
-    // ------------------------------------------------------
-    // 📊 Métricas de Sistema Multinivel
-    // ------------------------------------------------------
-    setInterval(async () => {
-      try {
-        // Contar relaciones A↔B activas
-        const alegKeys = await redis.keys("aleg:*:bleg");
-        const blegKeys = await redis.keys("bleg:*:aleg");
-        
-        // Contar bridges activos
-        const bridgeKeys = await redis.keys("bridge:*");
-        
-        // Contar canales activos
-        const activeCallKeys = await redis.keys("activeCall:*");
-        
-        log("info", `📊 Métricas Sistema: A↔B=${alegKeys.length}, Bridges=${bridgeKeys.length}, Canales=${activeCallKeys.length}`);
-        
-        // Detectar posibles problemas
-        if (alegKeys.length > 50) {
-          log("warn", `⚠️ Alto número de relaciones A↔B: ${alegKeys.length}`);
-        }
-        
-        if (activeCallKeys.length > 100) {
-          log("warn", `⚠️ Alto número de canales activos: ${activeCallKeys.length}`);
-        }
-        
-      } catch (err) {
-        log("error", "Error en métricas de sistema", err.message);
-      }
-    }, 60000); // cada 1 minuto
   }
 );
 
