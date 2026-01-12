@@ -1,0 +1,44 @@
+[Unit]
+Description=Telephony Core - Asterisk ARI Integration Service
+Documentation=https://github.com/your-org/telephony-core
+After=network.target asterisk.service redis.service
+Wants=asterisk.service redis.service
+
+[Service]
+Type=simple
+User=asterisk
+Group=asterisk
+WorkingDirectory=/opt/telephony-core
+
+# Variables de entorno
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/telephony-core/.env
+
+# Comando principal
+ExecStart=/usr/bin/node /opt/telephony-core/services/voicebot/voicebot-handler.js
+
+# Reinicio automático
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telephony-core
+
+# Límites de recursos
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Seguridad
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Timeouts
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
