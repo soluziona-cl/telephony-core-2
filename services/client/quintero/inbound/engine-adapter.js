@@ -1,5 +1,6 @@
-import { log } from '../../../../lib/logger.js';
+import { normalizeDomainResponse, assertDomainResponse } from '../domainResponse.js';
 import quinteroBot from '../bot/index.js';
+import { log } from '../../../../lib/logger.js';
 
 /**
  * 🌉 Quintero Capsule Adapter
@@ -19,23 +20,43 @@ export default async function quinteroAdapter(ctx) {
 
     try {
         // Delegate to internal bot logic
-        const result = await quinteroBot(ctx);
+        let result = await quinteroBot(ctx);
 
-        // ✅ VALIDACIÓN DEFENSIVA
+        // ✅ VALIDACIÓN DEFENSIVA (Legacy prompt check)
         if (result.prompt) {
             result.prompt = safePrompt(result.prompt);
         }
 
+        // ✅ GOBERNANZA: Normalizar y Validar Contrato
+        // Mapeamos legacy properties si es necesario antes de normalizar
+        if (result.shouldHangup && !result.action) {
+            result.action = { type: 'END_CALL', payload: { reason: 'LEGACY_SHOULD_HANGUP' } };
+        }
+
+        const normalized = normalizeDomainResponse(result, ctx.state?.rutPhase);
+        const errs = assertDomainResponse(normalized);
+
+        if (errs.length > 0) {
+            log("warn", `⚠️ [CAPSULE][CONTRACT] Invalid response from bot: ${JSON.stringify(errs)}`, { result });
+            // Fail-Closed Fallback: Ask user to repeat or hold, do not crash.
+            return normalizeDomainResponse({
+                nextPhase: ctx.state?.rutPhase || 'WAIT_BODY',
+                ttsText: 'Disculpe, hubo un error técnico. ¿Podría repetir?',
+                silent: false,
+                skipUserInput: false,
+                action: { type: 'SET_STATE' }
+            });
+        }
+
         log("debug", "🌉 [CAPSULE] Exiting Quintero Adapter", {
-            phase: result.state?.rutPhase,
-            next: result.nextPhase
+            phase: normalized.nextPhase,
+            tts: normalized.ttsText ? 'YES' : 'NO'
         });
 
-        return result;
+        return normalized;
+
     } catch (error) {
         log("error", "🌉 💥 [CAPSULE] Error inside Quintero Adapter", error);
-        throw error; // Let the engine handle global errors, or map to a safe fallback here
+        throw error; // Engine handles global errors
     }
 }
-
-

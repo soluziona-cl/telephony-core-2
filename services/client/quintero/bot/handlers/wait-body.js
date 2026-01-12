@@ -23,11 +23,12 @@ export default async function waitBody(ctx, state) {
 
   // 🛡️ GUARDRAIL ANTICIPADO: Si no hay input, no llamar al webhook
   if (!cleanTranscript || cleanTranscript.trim().length === 0) {
-    log("info", `🛡️ [WAIT_BODY] Input vacío detectado. Manteniendo fase y solicitando RUT.`);
+    log("info", `🛡️ [WAIT_BODY] Input vacío detectado. Manteniendo fase y solicitando RUT (Explicit Greeting).`);
     return {
-      ttsText: "Por favor, indíqueme su RUT completo, con el dígito verificador.",
+      ttsText: "Hola, bienvenido al Consultorio de Quintero. Para ayudarle, necesito su RUT completo, incluyendo el dígito verificador. ¿Me lo puede indicar por favor?",
       nextPhase: 'WAIT_BODY',
-      shouldHangup: false
+      shouldHangup: false,
+      action: { type: 'SET_STATE' } // Explicit action
     };
   }
 

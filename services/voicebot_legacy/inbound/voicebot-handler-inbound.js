@@ -53,8 +53,12 @@ export async function handleVoiceBot(ari, channel, args, linkedId) {
             // Importar router dinámicamente solo cuando se necesita
             const { resolveDomain, extractBotName } = await import("../router/voicebot-domain-router.js");
             const domain = await resolveDomain(mode);
-            const botName = extractBotName(mode);
-            
+            // 🛡️ FIX: Forzar botName para capsulas conocidas si extractBotName falla o es ambiguo
+            let botName = extractBotName(mode);
+            if (mode.includes('quintero')) {
+                botName = 'quintero';
+            }
+
             if (domain) {
                 log("info", `🔀 [VB HANDLER] Usando dominio para mode=${mode}, bot=${botName}`);
                 // El dominio se pasará al engine para que lo use cuando corresponda

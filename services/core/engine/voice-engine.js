@@ -1070,14 +1070,23 @@ export async function startVoiceBotSessionV3(ari, channel, ani, dnis, linkedId, 
               try {
                 await channel.hangup();
               } catch (e) {
-                log("warn", `[ENGINE] Error colgando canal: ${e.message}`);
+                const msg = (e.message || '').toLowerCase();
+                if (msg.includes('channel not found') || msg.includes('404')) {
+                  log("info", `ℹ️ [ENGINE] Canal ya colgado (expected race): ${e.message}`);
+                } else {
+                  log("warn", `[ENGINE] Error colgando canal: ${e.message}`);
+                }
               }
+              // FIX: Evitar doble reproducción
+              skipUserInputResult.ttsText = null;
               break;
           }
         }
 
         // Reproducir TTS si existe
-        if (skipUserInputResult.ttsText) {
+        if (conversationState.terminated) {
+          log("debug", "[ENGINE] Conversación terminada. Saltando TTS post-acción.");
+        } else if (skipUserInputResult.ttsText) {
           log("info", `🗣️ [ENGINE] Generando TTS para fase sin input: "${skipUserInputResult.ttsText}"`);
           conversationState.history.push({ role: 'assistant', content: skipUserInputResult.ttsText });
           openaiClient.lastAssistantResponse = skipUserInputResult.ttsText;
