@@ -25,26 +25,10 @@ export default async function waitBody(ctx, state) {
   // Si no hay input, debemos decidir si es el saludo inicial o un silencio posterior
   if (!cleanTranscript || cleanTranscript.trim().length === 0) {
 
-    // CASO 1: SALUDO INICIAL (Primer turno, sin flag)
-    if (!state.greetingPlayed) {
-      log("info", `🛡️ [WAIT_BODY] Start of Call detected. Playing Initial Greeting.`);
-      return {
-        ttsText: "Hola, bienvenido al Consultorio de Quintero. Para ayudarle, necesito su RUT completo, incluyendo el dígito verificador. ¿Me lo puede indicar por favor?",
-        nextPhase: 'WAIT_BODY',
-        shouldHangup: false,
-        action: {
-          type: 'SET_STATE',
-          payload: {
-            updates: {
-              greetingPlayed: true
-            }
-          }
-        }
-      };
-    }
+    // CASO 1: SILENCIO (Usuario no habla)
+    // El saludo inicial YA se jugó en START_GREETING. Si llegamos aquí con empty, es silencio.
 
-    // CASO 2: SILENCIO POSTERIOR (Ya saludamos, el usuario se quedó callado)
-    log("info", `🛡️ [WAIT_BODY] Silence detected (Greeting already played). Treating as NO_INPUT.`);
+    log("info", `🛡️ [WAIT_BODY] Silence detected. Treating as NO_INPUT.`);
 
     // Incrementar intentos de RUT (usamos la misma métrica de intentos)
     state.rutAttempts++;

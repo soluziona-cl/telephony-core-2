@@ -14,6 +14,7 @@ import checkAvailability from './handlers/check-availability.js';
 import informAvailability from './handlers/inform-availability.js';
 import confirmAppointment from './handlers/confirm-appointment.js';
 import finalize from './handlers/finalize.js';
+import startGreeting from './handlers/start-greeting.js';
 import * as tts from './tts/messages.js';
 
 /**
@@ -22,7 +23,7 @@ import * as tts from './tts/messages.js';
  */
 export function initialState() {
   return {
-    rutPhase: 'WAIT_BODY',
+    rutPhase: 'START_GREETING',
     rutBody: null,
     rutDv: null,
     rutFormatted: null, // RUT completo formateado desde webhook FORMAT_RUT
@@ -63,6 +64,10 @@ export async function runState(ctx, state) {
   let result;
 
   switch (rutPhase) {
+    case 'START_GREETING':
+      result = await startGreeting(ctx, state);
+      break;
+
     case 'WAIT_BODY':
     case 'WAIT_RUT':
       result = waitBody(ctx, state);
