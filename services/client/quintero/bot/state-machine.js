@@ -44,7 +44,8 @@ export function initialState() {
     alternativesAttempts: 0,
     confirmed: false,
     lastTtsPhase: null, // 🛡️ Anti-replay: Última fase hablada
-    lastTtsText: null   // 🛡️ Anti-replay: Último texto hablado
+    lastTtsText: null,   // 🛡️ Anti-replay: Último texto hablado
+    greetingPlayed: false // 🛡️ State: Flag para controlar saludo inicial único
   };
 }
 

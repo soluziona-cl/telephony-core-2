@@ -1,8 +1,9 @@
+#!/usr/bin/env node
 import fs from "fs";
 import { promisify } from "util";
 import { exec } from "child_process";
 import https from "https";
-import { inboundConfig } from "../services/voicebot/inbound/voicebot-config-inbound.js";
+import { inboundConfig } from "../services/voicebot_legacy/inbound/voicebot-config-inbound.js";
 
 const execAsync = promisify(exec);
 

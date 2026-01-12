@@ -21,14 +21,62 @@ export default async function waitBody(ctx, state) {
   const cleanTranscript = transcript || "";
   log("debug", `⚙️ [WAIT_BODY] Input="${cleanTranscript}"`);
 
-  // 🛡️ GUARDRAIL ANTICIPADO: Si no hay input, no llamar al webhook
+  // 🛡️ GUARDRAIL & SILENCE HANDLING
+  // Si no hay input, debemos decidir si es el saludo inicial o un silencio posterior
   if (!cleanTranscript || cleanTranscript.trim().length === 0) {
-    log("info", `🛡️ [WAIT_BODY] Input vacío detectado. Manteniendo fase y solicitando RUT (Explicit Greeting).`);
+
+    // CASO 1: SALUDO INICIAL (Primer turno, sin flag)
+    if (!state.greetingPlayed) {
+      log("info", `🛡️ [WAIT_BODY] Start of Call detected. Playing Initial Greeting.`);
+      return {
+        ttsText: "Hola, bienvenido al Consultorio de Quintero. Para ayudarle, necesito su RUT completo, incluyendo el dígito verificador. ¿Me lo puede indicar por favor?",
+        nextPhase: 'WAIT_BODY',
+        shouldHangup: false,
+        action: {
+          type: 'SET_STATE',
+          payload: {
+            updates: {
+              greetingPlayed: true
+            }
+          }
+        }
+      };
+    }
+
+    // CASO 2: SILENCIO POSTERIOR (Ya saludamos, el usuario se quedó callado)
+    log("info", `🛡️ [WAIT_BODY] Silence detected (Greeting already played). Treating as NO_INPUT.`);
+
+    // Incrementar intentos de RUT (usamos la misma métrica de intentos)
+    state.rutAttempts++;
+
+    if (state.rutAttempts >= 3) {
+      state.rutPhase = 'FAILED';
+      return {
+        ttsText: tts.rutCaptureFailed(),
+        nextPhase: 'FAILED',
+        shouldHangup: true,
+        action: {
+          type: "END_CALL",
+          payload: {
+            reason: "FAILED_SILENCE",
+            ttsText: tts.rutCaptureFailed()
+          }
+        }
+      };
+    }
+
     return {
-      ttsText: "Hola, bienvenido al Consultorio de Quintero. Para ayudarle, necesito su RUT completo, incluyendo el dígito verificador. ¿Me lo puede indicar por favor?",
+      ttsText: tts.askRutRetry(),
       nextPhase: 'WAIT_BODY',
       shouldHangup: false,
-      action: { type: 'SET_STATE' } // Explicit action
+      action: {
+        type: "SET_STATE",
+        payload: {
+          updates: {
+            rutAttempts: state.rutAttempts
+          }
+        }
+      }
     };
   }
 
