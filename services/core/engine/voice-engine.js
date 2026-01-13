@@ -9,8 +9,11 @@
 // =========================================================
 
 
+import fs from "fs";
 import { exec } from "child_process";
 import { promisify } from "util";
+import { playWithBargeIn } from "./legacy/legacy-helpers.js";
+import { SkipInputOrchestrator } from "./orchestration/skip-input-orchestrator.js";
 import { OpenAIRealtimeClientV3 } from "./openai-client.js";
 import { log } from "../../../lib/logger.js";
 import { startRecording, stopRecording } from "../telephony/telephony-recorder.js";
@@ -40,7 +43,6 @@ import { Guardrails } from "./policies/guardrails.js";
 import { ivrSafetyDelay, shortTurnDelay, technicalWorkaroundDelay, recordingSettlementDelay } from "./async/sleep.js";
 import { waitPlaybackFinished } from "./async/waiters.js";
 import { pollUntil } from "./async/polling.js";
-import { SkipInputOrchestrator } from "./orchestration/skip-input-orchestrator.js";
 import { StrictModeOrchestrator } from "./orchestration/strict-mode.js";
 import { NormalModeOrchestrator } from "./orchestration/normal-mode.js";
 import { flowTrace } from "../telemetry/flow-trace.js";
@@ -423,6 +425,7 @@ export async function startVoiceBotSessionV3(ari, channel, ani, dnis, linkedId, 
 
   if (domainContext && domainContext.domain) {
     log("info", `🔀 [ENGINE] DomainContext recibido: bot=${domainContext.botName || 'unknown'}, mode=${domainContext.mode || 'unknown'}`);
+    log("info", "[ENGINE] Domain capsule detected, legacy disabled");
   } else {
     log("debug", `[ENGINE] Sin DomainContext - usando lógica genérica`);
   }
@@ -619,7 +622,7 @@ export async function startVoiceBotSessionV3(ari, channel, ani, dnis, linkedId, 
       }
 
       log("info", "✅ Saludo inicial completado (dominio)");
-      await technicalWorkaroundDelay();
+      // await technicalWorkaroundDelay(); // Managed by domain if needed
     } else {
       // 🔙 LEGACY: Usar lógica actual del engine
       log("info", "🔙 [ENGINE] Usando saludo legacy (sin dominio)");
@@ -645,6 +648,9 @@ export async function startVoiceBotSessionV3(ari, channel, ani, dnis, linkedId, 
     log("warn", `⚠️ Error en saludo inicial: ${err.message} `);
   }
 
+  // Legacy Instantiation
+  const skipInputOrchestrator = new SkipInputOrchestrator({ ari, PHASES });
+
   for (let turn = 1; conversationState.active && turn <= MAX_TURNS_PER_CALL; turn++) {
     conversationState.turns = turn;
 
@@ -666,19 +672,10 @@ export async function startVoiceBotSessionV3(ari, channel, ani, dnis, linkedId, 
     // 🛡️ Verificar si el dominio indica que NO debe esperar voz (skipUserInput)
     // Esto es genérico: cualquier dominio puede indicar fases silenciosas
     // ✅ ORCHESTRATION: Check for silent phase / skip input / auto-advance (Phase 10)
-    const skipResult = await skipInputOrchestrator.checkAndExecute(
-      channel,
-      openaiClient,
-      domainContext,
-      businessState,
-      conversationState,
-      turn,
-      linkedId
-    );
+    // 🛡️ SkipInputOrchestrator DEPRECATED/REMOVED. Domain should handle silence via ttsText: null or silent: true.
+    // Proceeding to input collection...
 
-    if (skipResult.shouldSkip) {
-      continue;
-    }
+    const shouldSkipUserInput = false; // Forced to false in Legacy Cleanup
 
 
     // =======================================================
