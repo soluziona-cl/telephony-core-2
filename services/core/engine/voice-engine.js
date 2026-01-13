@@ -35,7 +35,7 @@ import { RecordingModule } from "./ari/recording.js";
 import { EngineRunner } from "./core/engine-runner.js";
 import { EngineLogger } from "./telemetry/engine-logger.js";
 import { PhaseManager } from "./core/phase-manager.js";
-import { playGreeting, playStillTherePrompt, recordUserTurn, sendSystemTextAndPlay, sendBvdaText, extractRutCandidate } from "./legacy/legacy-helpers.js";
+import { playGreeting, playStillTherePrompt, recordUserTurn, sendSystemTextAndPlay, sendBvdaText, extractRutCandidate, processUserTurnWithOpenAI } from "./legacy/legacy-helpers.js";
 import { shouldTransferToQueue, transferToQueue } from "./domain/transfers.js";
 import { executeDomainAction } from "./legacy/legacy-actions.js";
 import { PHASES, isSilentPhase } from "./domain/phases.js";
@@ -155,7 +155,7 @@ async function runModularEngine(ari, channel, ani, dnis, linkedId, promptFile, d
 
   const terminationPolicy = new TerminationPolicy();
   const skipInputOrchestrator = new SkipInputOrchestrator({ ari, PHASES });
-  const strictModeOrchestrator = new StrictModeOrchestrator({ ari });
+  // const strictModeOrchestrator = new StrictModeOrchestrator({ ari }); // REMOVED (Legacy Crash Fix)
   const normalModeOrchestrator = new NormalModeOrchestrator({ ari });
   const phaseManager = new PhaseManager(PHASES, logger);
 
@@ -849,50 +849,75 @@ export async function startVoiceBotSessionV3(ari, channel, ani, dnis, linkedId, 
     // Procesamos normalmente con transcripción de audio
     // --- MODO ESTRICTO (RUT) phase-driven ---
     // If we are in a phase that requires specific handling (Strict), delegation is now simplified.
-    if (businessState.rutPhase !== 'NONE' && businessState.rutPhase !== 'COMPLETE' && businessState.rutPhase !== 'ERROR') {
-      const strictResult = await strictModeOrchestrator.execute(
-        channel,
-        openaiClient,
-        domainContext,
-        businessState,
-        conversationState,
-        turn,
-        linkedId,
-        userWavPath,
-        promptFile
-      );
+    // --- DOMAIN PROCESSING (Unified) ---
+    // Instead of splitting Strict/Normal, we simply transcribe and delegate if a domain exists.
 
-      if (strictResult.terminated) {
-        conversationState.active = false;
+    // 1. Transcribe (Block until done)
+    // 1. Transcribe (Block until done)
+    responseBaseName = await processUserTurnWithOpenAI(userWavPath, openaiClient);
+    transcript = await waitForTranscript(openaiClient);
+
+    conversationState.history.push({ role: 'user', content: transcript });
+
+    // 2. Delegate to Domain
+    if (domainContext && domainContext.domain) {
+      log("info", `🌉 [ENGINE] Delegating matched intent to Domain (Phase: ${businessState.rutPhase})`);
+      try {
+        const ctx = {
+          transcript,
+          sessionId: linkedId,
+          ani,
+          dnis,
+          botName: domainContext.botName || 'default',
+          state: businessState,
+          ari,
+          channel
+        };
+
+        // 🛡️ [ANTI-LOOP] Ensure counters are passed? state references businessState which has them. Correct.
+
+        const domainResult = await domainContext.domain(ctx);
+
+        if (ctx.state) Object.assign(businessState, ctx.state);
+
+        if (domainResult.ttsText) {
+          await openaiClient.sendSystemText(domainResult.ttsText);
+          conversationState.history.push({ role: 'assistant', content: domainResult.ttsText });
+        }
+
+        if (domainResult.shouldHangup) {
+          conversationState.terminated = true;
+          log("info", "👋 [ENGINE] Domain requested hangup after processing");
+        }
+
+        // Skip Normal/Legacy processing since Domain handled it
+        continue;
+      } catch (err) {
+        log("error", `❌ [ENGINE] Domain Processing Error: ${err.message}`);
       }
-
-      // El modo estricto maneja su propio playback internamente, continuar loop
-      continue;
-    }
-    // --- MODO NORMAL (Conversacional) ---
-    else {
-      const normalResult = await normalModeOrchestrator.execute(
-        channel,
-        openaiClient,
-        businessState,
-        conversationState,
-        turn,
-        linkedId,
-        userWavPath
-      );
-
-      if (!normalResult.active) {
-        conversationState.active = false;
-        // Logic loop condition will handle termination, or we can break if needed
-      }
     }
 
+    const normalResult = await normalModeOrchestrator.execute(
+      channel,
+      openaiClient,
+      businessState,
+      conversationState,
+      turn,
+      linkedId,
+      userWavPath
+    );
 
-
-
-
-
+    if (!normalResult.active) {
+      conversationState.active = false;
+      // Logic loop condition will handle termination, or we can break if needed
+    }
   }
+
+
+
+
+
+
 
   openaiClient.disconnect();
   log("info", `🔚[VB ENGINE V3] Sesión finalizada LinkedId = ${linkedId} (turnos exitosos: ${audioState.successfulTurns})`);

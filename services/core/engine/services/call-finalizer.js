@@ -106,7 +106,17 @@ export class CallFinalizer {
      */
     static async persistToSql(session, endTime, ani, dnis, finalFileName, transcriptText, businessState, audioState) {
         try {
-            log("info", `🗄️ [FINALIZE] Registrando gestión en SQL Server...`);
+            // 🛡️ GUARD: Identificador is mandatory for sp_GuardarGestionLlamada
+            const identificador = businessState.identificador || session.sessionId; // Fallback to sessionId/linkedId if acceptable, otherwise strict check? 
+            // User requested: "Ensured essential context variables like ctx.identificador... are initialized".
+            // If it's still missing, we skip to avoid crash.
+
+            if (!identificador) {
+                log("warn", "⚠️ [FINALIZE] Falta @Identificador (businessState.identificador). Omitiendo guardado SQL para evitar error.");
+                return;
+            }
+
+            log("info", `🗄️ [FINALIZE] Registrando gestión en SQL Server (Identificador=${identificador})...`);
             const pool = await poolPromise;
             if (pool) {
                 await pool.request()
@@ -115,7 +125,8 @@ export class CallFinalizer {
                     .input('Agente', sql.NVarChar, 'VoiceBot')
                     .input('ANI', sql.NVarChar, ani)
                     .input('DNIS', sql.NVarChar, dnis)
-                    .input('RUT_Cliente', sql.NVarChar, businessState.dni || 'UNKNOWN') // Use DNI if validated, else UNKNOWN? original used rutFormatted or rutBody
+                    .input('RUT_Cliente', sql.NVarChar, businessState.dni || 'UNKNOWN') // Use DNI if validated, else UNKNOWN
+                    .input('Identificador', sql.NVarChar, identificador) // ✅ ADDED
                     .input('Nombre_Archivo_Grabacion', sql.NVarChar, `${finalFileName}.wav`)
                     .input('Estado_Llamada', sql.NVarChar, session.terminated ? 'Terminated' : 'Completed')
                     .input('Transcription_Log', sql.NVarChar, transcriptText)
