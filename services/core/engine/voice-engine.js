@@ -675,41 +675,9 @@ export async function startVoiceBotSessionV3(ari, channel, ani, dnis, linkedId, 
     // 🛡️ SkipInputOrchestrator DEPRECATED/REMOVED. Domain should handle silence via ttsText: null or silent: true.
     // Proceeding to input collection...
 
-    const shouldSkipUserInput = false; // Forced to false in Legacy Cleanup
-
-
-    // =======================================================
-    // 1) Turno inicial: Pregunta Proactiva del Bot (Solo turno 1)
-    // =======================================================
-    // ✅ ELIMINADO: El saludo inicial ahora incluye la solicitud de RUT
-    // por lo que no necesitamos un turno proactivo separado.
-    /*
-    if (turn === 1 && !audioState.hasSpeech) {
-      log("info", "🎤 [VB V3] Turno 1: Bot inicia solicitud de RUT (Protegido + Keep-Alive)");
-  
-      // 🔒 Turno 1 proactive: NO interrumpible (BVDA)
-      // Usamos una ruta fija para el primer mensaje si es común, para evitar latencia de OpenAI en Turno 1
-      const turn1Text = "Para comenzar, por favor indíqueme los números de su RUT, sin el dígito verificador.";
-      const turn1CachePath = `${VOICEBOT_PATH}/turn1_rut_request.wav`;
-  
-      if (fs.existsSync(turn1CachePath)) {
-        log('info', '📂 [CACHE] Usando audio local para solicitud de RUT Turno 1');
-        await playWithBargeIn(ari, channel, 'turn1_rut_request', openaiClient, { bargeIn: false });
-      } else {
-        await sendBvdaText(ari, channel, openaiClient, turn1Text);
-      }
-    }
-    */
-
     // =======================================================
     // 2) Esperar voz real
     // =======================================================
-    // 🛡️ GUARDRAIL: Si es fase silenciosa, saltar grabación
-    if (shouldSkipUserInput) {
-      log("info", `🔇 [ENGINE] Fase silenciosa detectada (skipUserInput=true), saltando grabación explícitamente`);
-      audioState.silentTurns = 0; // Resetear silencios para no triggerar timeout
-      continue;
-    }
 
     // 🛡️ GUARDRAIL: Permitir espera de voz en fases críticas incluso si Turn > 2
     // 🛡️ GUARDRAIL: Permitir espera de voz en fases críticas incluso si Turn > 2
