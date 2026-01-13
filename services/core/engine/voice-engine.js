@@ -700,24 +700,57 @@ export async function startVoiceBotSessionV3(ari, channel, ani, dnis, linkedId, 
       if (!voiceCheck.detected) {
         log("warn", `🤫[VB V3] Sin voz detectada`);
 
-        const silenceResult = silencePolicy.evaluate(session, false);
+        // 🛡️ [MODULAR] Silence Policy Removed from Engine
+        // Delegating silence handling to Domain
+        if (domainContext && domainContext.domain) {
+          log("info", "🌉 [ENGINE] Reportando NO_INPUT al dominio");
 
-        if (silenceResult.action === 'prompt') {
-          await playStillTherePrompt(ari, channel, openaiClient);
-        } else if (silenceResult.action === 'goodbye') {
-          await terminationPolicy.terminate(session, channelControl, 'max_silence');
-          conversationState.active = false;
-          break;
+          try {
+            const ctx = {
+              transcript: "", // EMPTY transcript = Silence
+              sessionId: linkedId,
+              ani,
+              dnis,
+              botName: domainContext.botName || 'default',
+              state: businessState,
+              ari,
+              channel
+            };
+
+            const domainResult = await domainContext.domain(ctx);
+
+            // Actualizar estado
+            if (ctx.state) Object.assign(businessState, ctx.state);
+
+            // Ejecutar respuesta del dominio
+            if (domainResult.ttsText) {
+              await openaiClient.sendSystemText(domainResult.ttsText);
+              conversationState.history.push({ role: 'assistant', content: domainResult.ttsText });
+            }
+            if (domainResult.shouldHangup) {
+              conversationState.terminated = true;
+              log("info", "👋 [ENGINE] Dominio solicitó colgar tras silencio");
+              break;
+            }
+
+            // Continuar al siguiente turno sin grabar
+            continue;
+          } catch (err) {
+            log("error", `❌ [ENGINE] Error delegando silencio al dominio: ${err.message}`);
+          }
+        } else {
+          // Fallback for NO DOMAIN (should be rare now)
+          audioState.silentTurns++;
+          if (audioState.silentTurns >= MAX_SILENT_TURNS) {
+            log("warn", "🛑 Max silence reached (Legacy Fallback)");
+            break;
+          }
+          continue;
         }
-
-        // Update local legacy state for logging consistency if needed, 
-        // but session context is the source of truth now.
-        audioState.silentTurns = session.consecutiveSilences;
 
         continue;
       } else {
-        // Reset silence policy on voice detected
-        silencePolicy.evaluate(session, true);
+        // Voice detected
         audioState.silentTurns = 0;
       }
 
@@ -744,18 +777,39 @@ export async function startVoiceBotSessionV3(ari, channel, ani, dnis, linkedId, 
       if (recResult.reason === "silence") {
         log("warn", `🤫[VB V3] Grabación vacía/silencio detected`);
 
-        const silenceResult = silencePolicy.evaluate(session, false);
+        // 🛡️ [MODULAR] Silence Policy Removed from Engine
+        // Delegating empty recording handling to Domain
+        if (domainContext && domainContext.domain) {
+          log("info", "🌉 [ENGINE] Reportando NO_INPUT (Empty Rec) al dominio");
+          try {
+            const ctx = {
+              transcript: "", // EMPTY transcript
+              sessionId: linkedId,
+              ani,
+              dnis,
+              botName: domainContext.botName || 'default',
+              state: businessState,
+              ari,
+              channel
+            };
+            const domainResult = await domainContext.domain(ctx);
+            if (ctx.state) Object.assign(businessState, ctx.state);
 
-        if (silenceResult.action === 'prompt') {
-          await playStillTherePrompt(ari, channel, openaiClient);
-        } else if (silenceResult.action === 'goodbye') {
-          await terminationPolicy.terminate(session, channelControl, 'max_silence');
-          conversationState.active = false;
-          break;
+            if (domainResult.ttsText) {
+              await openaiClient.sendSystemText(domainResult.ttsText);
+              conversationState.history.push({ role: 'assistant', content: domainResult.ttsText });
+            }
+            if (domainResult.shouldHangup) {
+              conversationState.terminated = true;
+              break;
+            }
+          } catch (err) {
+            log("error", `❌ [ENGINE] Error delegando empty rec al dominio: ${err.message}`);
+          }
+          continue;
         }
 
-        // Update local legacy state
-        audioState.silentTurns = session.consecutiveSilences;
+        audioState.silentTurns++;
         continue;
       }
 

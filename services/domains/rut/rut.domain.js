@@ -35,15 +35,71 @@ export async function runRutDomain(ctx) {
             };
 
         case RUT_PHASES.WAIT_BODY:
-        case 'WAIT_BODY': // Compatibility with Quintero legacy phase name if needed, but we should enforce RUT_PHASES
+        case 'WAIT_BODY': // Compatibility
             {
-                const result = parseAndValidateRut(transcript);
-                if (!result.valid) {
+                // 🛡️ [ANTI-LOOP] 1. Check for Silence (No Input)
+                if (!transcript || transcript.trim() === '') {
+                    const noInputCount = (state.noInputCount || 0) + 1;
+
+                    let silenceMsg = 'No te escuché bien. Por favor dime tu RUT completo sin dígito verificador.';
+                    if (noInputCount === 2) silenceMsg = 'Sigo sin escucharte. Por favor habla un poco más fuerte.';
+
+                    if (noInputCount >= 3) {
+                        return {
+                            ttsText: 'Lo siento, no he podido escucharte. Por favor intenta llamar nuevamente más tarde.',
+                            shouldHangup: true,
+                            action: { type: 'HANGUP' }
+                        };
+                    }
+
                     return {
-                        ttsText: 'El RUT no es válido, repítalo por favor',
-                        nextPhase: RUT_PHASES.WAIT_BODY
+                        ttsText: silenceMsg,
+                        nextPhase: RUT_PHASES.WAIT_BODY,
+                        action: {
+                            type: 'SET_STATE',
+                            payload: {
+                                updates: { noInputCount: noInputCount }
+                            }
+                        }
                     };
                 }
+
+                // Reset Silence Count on input
+                if (state.noInputCount > 0) {
+                    state.noInputCount = 0; // Will be persisted via next SET_STATE if valid, or we should explicitly reset?
+                    // Let's assume successful processing or invalid processing resets "Silence" streak, 
+                    // but maybe we track "Invalid" streak separately.
+                }
+
+                const result = parseAndValidateRut(transcript);
+                if (!result.valid) {
+                    const invalidCount = (state.invalidCount || 0) + 1;
+
+                    if (invalidCount >= 3) {
+                        return {
+                            ttsText: 'No he podido validar tu RUT. Por favor intenta nuevamente más tarde.',
+                            shouldHangup: true,
+                            action: { type: 'HANGUP' }
+                        };
+                    }
+
+                    return {
+                        ttsText: 'El RUT no parece válido. Por favor repítalo claramente.',
+                        nextPhase: RUT_PHASES.WAIT_BODY,
+                        action: {
+                            type: 'SET_STATE',
+                            payload: {
+                                updates: {
+                                    invalidCount: invalidCount,
+                                    noInputCount: 0 // Reset silence count
+                                }
+                            }
+                        }
+                    };
+                }
+
+                // Reset Valid Count on success
+                // ...
 
                 const patient = await fetchPatient(result.rut);
                 if (!patient) {
@@ -67,7 +123,9 @@ export async function runRutDomain(ctx) {
                                 rutPhase: RUT_PHASES.CONFIRM,
                                 patient: patient,
                                 dni: result.rut,
-                                nombre_paciente: patient.nombre_completo || patient.nombre
+                                nombre_paciente: patient.nombre_completo || patient.nombre,
+                                noInputCount: 0,
+                                invalidCount: 0
                             }
                         }
                     }

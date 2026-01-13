@@ -94,7 +94,7 @@ export function isValidRecording(wavPath) {
     try {
         const stats = fs.statSync(wavPath);
         // FILTRO CRÍTICO: Ignorar audios menores a 6KB (WebRTC noise / micro-turns)
-        if (stats.size < 6000) {
+        if (stats.size < 3000) {
             log("warn", `🤫 [VB V3] Audio ignorado por tamaño insuficiente: ${stats.size} bytes`);
             return false;
         }
