@@ -712,6 +712,7 @@ AriClient.connect(
               domain: capsule,
               mode: mode,
               botName: capsule ? 'Capsule' : 'Legacy',
+              systemPrompt: capsule ? capsule.systemPrompt : undefined, // ✅ Inject System Prompt
               state: {} // ✅ State persistence for V3 Engine
             });
           } catch (err) {

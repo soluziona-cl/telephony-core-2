@@ -27,7 +27,8 @@ export async function startVoiceBotSessionV3(
     const engineState = {
         active: true,
         turn: 0,
-        silentCount: 0
+        silentCount: 0,
+        skipInput: false // ✅ New Flag for Silent Loop
     };
 
     const conversationState = {
@@ -73,8 +74,11 @@ export async function startVoiceBotSessionV3(
         });
 
         // 2️⃣ UPDATE STATE & APPLY RESULT
-        if (initResult && initResult.state) {
-            domainContext.state = initResult.state;
+        if (initResult) {
+            if (initResult.state) domainContext.state = initResult.state;
+            // Check for silent transition immediately
+            engineState.skipInput = initResult.silent === true;
+            domainContext.lastResult = initResult;
         }
 
         await applyDomainResult(initResult, openaiClient, conversationState, ari, channel);
@@ -95,41 +99,57 @@ export async function startVoiceBotSessionV3(
         engineState.turn++;
         log("info", `🔄 Turn ${engineState.turn}`);
 
-        const voiceDetected = await waitForRealVoice(channel, {
-            maxWaitMs: config.audio.maxWaitMs || 4000,
-            minTalkingEvents: 1
-        });
+        let transcript = "";
 
-        if (!voiceDetected.detected) {
-            engineState.silentCount++;
+        // 🛑 SILENT MODE CHECK
+        if (engineState.skipInput) {
+            log("info", "⏩ [ENGINE] Silent Turn: Skipping Input & STT");
+            engineState.skipInput = false; // Reset, domain must re-assert silent each time if needed
+        } else {
+            // 👂 NORMAL LISTENING MODE
+            const voiceDetected = await waitForRealVoice(channel, {
+                maxWaitMs: config.audio.maxWaitMs || 4000,
+                minTalkingEvents: 1
+            });
 
-            if (engineState.silentCount >= MAX_SILENT_TURNS) {
-                log("warn", "🛑 Max silence reached");
-                break;
+            if (!voiceDetected.detected) {
+                engineState.silentCount++;
+
+                if (engineState.silentCount >= MAX_SILENT_TURNS) {
+                    log("warn", "🛑 Max silence reached");
+                    break;
+                }
+
+                await delegateDomainEvent('NO_INPUT', domainContext, openaiClient, conversationState, ari, channel, ani, dnis, linkedId);
+                // Check if NO_INPUT handler requested silent mode for retry
+                if (domainContext.lastResult?.silent) {
+                    engineState.skipInput = true;
+                }
+                continue;
             }
 
-            await delegateDomainEvent('NO_INPUT', domainContext, openaiClient, conversationState, ari, channel, ani, dnis, linkedId);
-            continue;
+            engineState.silentCount = 0;
+
+            const rec = await recordUserTurn(channel, engineState.turn);
+            if (!rec.ok) {
+                log("warn", `⚠️ Recording failed (${rec.reason})`);
+                continue;
+            }
+
+            const stats = fs.statSync(rec.path);
+            if (stats.size < MIN_AUDIO_BYTES) {
+                log("warn", `🤫 Audio too small (${stats.size} bytes)`);
+                await delegateDomainEvent('NO_INPUT', domainContext, openaiClient, conversationState, ari, channel, ani, dnis, linkedId);
+                if (domainContext.lastResult?.silent) {
+                    engineState.skipInput = true;
+                }
+                continue;
+            }
+
+            // TRANSCRIBE
+            await openaiClient.processAudio(rec.path);
+            transcript = await openaiClient.waitForTranscript();
         }
-
-        engineState.silentCount = 0;
-
-        const rec = await recordUserTurn(channel, engineState.turn);
-        if (!rec.ok) {
-            log("warn", `⚠️ Recording failed (${rec.reason})`);
-            continue;
-        }
-
-        const stats = fs.statSync(rec.path);
-        if (stats.size < MIN_AUDIO_BYTES) {
-            log("warn", `🤫 Audio too small (${stats.size} bytes)`);
-            await delegateDomainEvent('NO_INPUT', domainContext, openaiClient, conversationState, ari, channel, ani, dnis, linkedId);
-            continue;
-        }
-
-        // TRANSCRIBE
-        await openaiClient.processAudio(rec.path);
-        const transcript = await openaiClient.waitForTranscript();
 
         // 3️⃣ REGULAR TURN
         const ctx = buildDomainCtx(transcript, domainContext, ari, channel, ani, dnis, linkedId);
@@ -139,8 +159,12 @@ export async function startVoiceBotSessionV3(
         });
 
         // UPDATE STATE
-        if (domainResult && domainResult.state) {
-            domainContext.state = domainResult.state;
+        if (domainResult) {
+            if (domainResult.state) domainContext.state = domainResult.state;
+            // ✅ UPDATE SKIP INPUT FLAG
+            engineState.skipInput = domainResult.silent === true;
+            // Store last result for checks
+            domainContext.lastResult = domainResult;
         }
 
         await applyDomainResult(domainResult, openaiClient, conversationState, ari, channel);
@@ -189,8 +213,9 @@ async function delegateDomainEvent(eventType, domainContext, openaiClient, conve
         event: eventType
     });
 
-    if (result && result.state) {
-        domainContext.state = result.state;
+    if (result) {
+        if (result.state) domainContext.state = result.state;
+        domainContext.lastResult = result;
     }
 
     await applyDomainResult(result, openaiClient, conversationState, ari, channel);
@@ -205,13 +230,15 @@ async function applyDomainResult(result, openaiClient, conversationState, ari, c
     // but we prefer strict here.
 
     const action = result.action || 'WAIT_INPUT'; // Default
+    const silent = result.silent === true; // Check silence for barge-in control
 
     // 1. AUDIO PLAYBACK (Implicit or Explicit)
     const audioFile = result.audio || result.soundFile;
     if (action === 'PLAY_AUDIO' || audioFile) {
         if (audioFile) {
-            log("info", `▶️ Playing Audio: ${audioFile}`);
-            await playWithBargeIn(ari, channel, audioFile, openaiClient, { bargeIn: true });
+            log("info", `▶️ Playing Audio: ${audioFile} (BargeIn=${!silent})`);
+            // ✅ IF SILENT=TRUE (No Input Expected), DISABLE BARGE-IN to prevent interruption
+            await playWithBargeIn(ari, channel, audioFile, openaiClient, { bargeIn: !silent });
         }
     }
 

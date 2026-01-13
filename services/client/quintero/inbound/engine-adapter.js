@@ -1,5 +1,7 @@
+import fs from 'fs';
 import { normalizeDomainResponse, assertDomainResponse } from '../domainResponse.js';
 import quinteroBot from '../bot/index.js';
+import webhookClient from '../n8n/webhook-client.js';
 import { log } from '../../../../lib/logger.js';
 
 /**
@@ -7,6 +9,10 @@ import { log } from '../../../../lib/logger.js';
  * The ONLY allowed entry point for the legacy engine to access Quintero logic.
  * Enforces isolation boundaries.
  */
+
+// ✅ LOAD SYSTEM PROMPT
+const systemPrompt = fs.readFileSync('/opt/telephony-core/services/client/quintero/openai/prompts/quintero-confirmacion.txt', 'utf-8');
+
 // ✅ GUARDRAIL: Validar estrictamente string prompt
 function safePrompt(prompt) {
     if (typeof prompt !== 'string') {
@@ -15,12 +21,55 @@ function safePrompt(prompt) {
     return prompt;
 }
 
-export default async function quinteroAdapter(ctx) {
+async function quinteroAdapter(ctx) {
     log("info", "🌉 [CAPSULE] Entering Quintero Adapter");
 
     try {
         // Delegate to internal bot logic
         let result = await quinteroBot(ctx);
+
+        // 🪝 WEBHOOK MIDDLEWARE (Synchronous execution from Engine POV)
+        if (result.action && result.action.type === 'WEBHOOK') {
+            const hookAction = result.action.action; // e.g. FORMAT_RUT
+            const payload = result.action;
+            log("info", `🪝 [ADAPTER] Intercepting WEBHOOK action: ${hookAction}`, payload);
+
+            let hookResult = { ok: false, reason: 'UNKNOWN_ACTION' };
+
+            try {
+                if (hookAction === 'FORMAT_RUT') {
+                    hookResult = await webhookClient.formatRut(payload.rut_raw, ctx.sessionId, ctx.ani, ctx.dnis);
+                } else if (hookAction === 'VALIDATE_PATIENT') {
+                    hookResult = await webhookClient.validatePatient(payload.rut, ctx.sessionId);
+                } else if (hookAction === 'GET_NEXT_AVAILABILITY') {
+                    // payload.rut, payload.especialidad
+                    hookResult = await webhookClient.getNextAvailability(payload.rut, payload.especialidad, ctx.sessionId);
+                } else if (hookAction === 'CONFIRM_AVAILABILITY') {
+                    hookResult = await webhookClient.confirmAvailability(ctx.sessionId);
+                } else if (hookAction === 'RELEASE_AVAILABILITY') {
+                    hookResult = await webhookClient.releaseAvailability(ctx.sessionId);
+                } else {
+                    log("warn", `⚠️ [ADAPTER] Unknown webhook action: ${hookAction}`);
+                }
+            } catch (err) {
+                log("error", `❌ [ADAPTER] Webhook execution failed: ${err.message}`);
+                hookResult = { ok: false, reason: 'EXECUTION_ERROR' };
+            }
+
+            // RE-ENTRANT CALL TO DOMAIN WITH RESULT
+            log("info", `🪝 [ADAPTER] Webhook executed, feeding back to domain...`, { ok: hookResult.ok });
+
+            result = await quinteroBot({
+                ...ctx,
+                event: 'WEBHOOK_RESPONSE',
+                webhookData: {
+                    action: hookAction,
+                    data: hookResult
+                },
+                // Pass updated state if the first call returned it (preserving potential updates)
+                state: result.state || ctx.state
+            });
+        }
 
         // ✅ VALIDACIÓN DEFENSIVA (Legacy prompt check)
         if (result.prompt) {
@@ -83,3 +132,8 @@ export default async function quinteroAdapter(ctx) {
         throw error; // Engine handles global errors
     }
 }
+
+// Attach system prompt to the adapter function
+quinteroAdapter.systemPrompt = systemPrompt;
+
+export default quinteroAdapter;
