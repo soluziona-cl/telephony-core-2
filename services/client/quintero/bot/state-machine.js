@@ -10,11 +10,14 @@ import confirm from './handlers/confirm.js';
 import askSpecialty from './handlers/ask-specialty.js';
 import parseSpecialty from './handlers/parse-specialty.js';
 import offerAlternatives from './handlers/offer-alternatives.js';
+import offerAlternativesIntro from './handlers/offer-alternatives-intro.js';
+import offerAlternativesWait from './handlers/offer-alternatives-wait.js';
 import checkAvailability from './handlers/check-availability.js';
 import informAvailability from './handlers/inform-availability.js';
 import confirmAppointment from './handlers/confirm-appointment.js';
 import finalize from './handlers/finalize.js';
 import startGreeting from './handlers/start-greeting.js';
+import goodbye from './handlers/goodbye.js';
 import * as tts from './tts/messages.js';
 
 /**
@@ -114,18 +117,35 @@ export async function runState(ctx, state) {
       result = await confirmAppointment(ctx, state);
       break;
 
+    case 'OFFER_ALTERNATIVES_INTRO':
+      result = await offerAlternativesIntro(ctx, state);
+      break;
+
+    case 'OFFER_ALTERNATIVES_WAIT':
+      result = await offerAlternativesWait(ctx, state);
+      break;
+
+    case 'GOODBYE':
+      result = await goodbye(ctx, state);
+      break;
+
     case 'FINALIZE':
       result = await finalize(ctx, state);
       break;
 
     case 'COMPLETE':
-      // Estado final - el bot puede continuar con otras tareas
-      log("info", "✅ [STATE MACHINE] RUT completado exitosamente");
+      // Estado final - colgar inmediatamente
+      log("info", "✅ [STATE MACHINE] Finalizando llamada");
       result = {
         ttsText: null,
         nextPhase: 'COMPLETE',
-        shouldHangup: false,
-        action: null
+        shouldHangup: true,
+        action: {
+          type: "END_CALL",
+          payload: {
+            reason: "COMPLETED"
+          }
+        }
       };
       break;
 

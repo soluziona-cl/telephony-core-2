@@ -189,6 +189,9 @@ export class OpenAIRealtimeClientV3 {
       throw new Error(`Archivo no existe: ${wavFilePath}`);
     }
 
+    // 🔄 Asegurar conexión antes de enviar audio
+    await this.ensureConnected();
+
     const pcm16Buffer = await this.convertWavToPCM16_24k(wavFilePath);
 
     if (!pcm16Buffer || pcm16Buffer.length === 0) {
@@ -247,6 +250,9 @@ export class OpenAIRealtimeClientV3 {
     if (!fs.existsSync(wavFilePath)) {
       throw new Error(`Archivo no existe: ${wavFilePath}`);
     }
+
+    // 🔄 Asegurar conexión antes de transcribir
+    await this.ensureConnected();
 
     const pcm16Buffer = await this.convertWavToPCM16_24k(wavFilePath);
 
@@ -483,6 +489,22 @@ export class OpenAIRealtimeClientV3 {
       this.ws.close();
       this.ws = null;
       this.isConnected = false;
+    }
+  }
+
+  /**
+   * 🔄 Asegurar conexión activa (auto-reconnect)
+   */
+  async ensureConnected() {
+    if (!this.isConnected && this.apiKey) {
+      log("warn", "⚠️ [OpenAI V3] Reconectando...");
+      try {
+        await this.connect();
+        log("info", "✅ [OpenAI V3] Reconexión exitosa");
+      } catch (err) {
+        log("error", `❌ [OpenAI V3] Fallo en reconexión: ${err.message}`);
+        throw err;
+      }
     }
   }
 

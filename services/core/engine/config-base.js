@@ -32,7 +32,7 @@ export const voicebotConfigBase = {
         transcripts: true,          // mantiene solo transcripts finales
         assistantMessages: true     // muestra solo mensajes finales
     },
-    
+
     audio: {
         minWavSizeBytes: 2000,
         silenceThreshold: 420,
@@ -63,6 +63,13 @@ export const voicebotConfigBase = {
 
     engine: {
         maxTurns: 20,
-        maxSilentTurns: 4
+        maxSilentTurns: 4,
+        useModularEngine: false,  // 🔧 Feature flag: Enable modular engine (Phase 4)
+        hold: {
+            enabled: false,          // 🎵 Feature flag: Enable HOLD with music-on-hold
+            enterOnFirstSilence: true,
+            maxHoldDurationMs: 30000,  // 30 seconds
+            musicClass: 'default'      // MOH class from musiconhold.conf
+        }
     }
 };

@@ -13,9 +13,10 @@ import * as tts from './tts/messages.js';
  * @returns {Promise<object>} - Resultado de la ejecución
  */
 export default async function quinteroBot(ctx) {
-  // Inicializar estado si no existe
-  if (!ctx.state) {
-    ctx.state = initialState();
+  // Inicializar estado si no existe o si rutPhase es 'NONE' (engine default)
+  if (!ctx.state || !ctx.state.rutPhase || ctx.state.rutPhase === 'NONE') {
+    const newState = initialState();
+    ctx.state = ctx.state ? { ...ctx.state, ...newState } : newState;
     log("info", "🆕 [QUINTERO] Estado inicializado");
   }
 

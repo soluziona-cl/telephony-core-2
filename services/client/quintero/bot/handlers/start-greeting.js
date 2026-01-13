@@ -16,7 +16,7 @@ export default async function startGreeting(ctx, state) {
     log("info", "📢 [START_GREETING] Ejecutando Turno 0 explícito");
 
     return {
-        ttsText: "sound:voicebot/greeting_sofia_2", // Audio estático fijo
+        ttsText: "sound:voicebot/quintero/greeting_sofia_2", // Audio estático organizado por cliente
         nextPhase: 'WAIT_BODY',
         shouldHangup: false,
         action: {

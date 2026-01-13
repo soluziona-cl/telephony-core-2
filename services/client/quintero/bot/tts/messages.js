@@ -7,7 +7,7 @@
  * Genera mensaje para solicitar RUT completo
  */
 export function askRut() {
-  return 'Por favor, indíqueme su RUT completo, incluyendo el dígito verificador.';
+  return 'sound:voicebot/quintero/ask_rut';
 }
 
 /**
@@ -65,7 +65,7 @@ export function askDv() {
  * Mensaje cuando no se entiende el RUT (intento intermedio)
  */
 export function askRutRetry() {
-  return 'Por favor, indíqueme su RUT completo, incluyendo el dígito verificador. Por ejemplo: catorce millones, trescientos cuarenta mil, guión ocho.';
+  return 'sound:voicebot/quintero/ask_rut_retry';
 }
 
 /**
@@ -148,10 +148,31 @@ export function denyRutChange() {
 }
 
 /**
+ * Mensaje de retry simplificado para especialidad (intento 2)
+ */
+export function askSpecialtyRetry() {
+  return 'sound:voicebot/quintero/ask_specialty_retry';
+}
+
+/**
+ * Mensaje con ejemplos específicos para especialidad (intento 3)
+ */
+export function askSpecialtyExamples() {
+  return 'sound:voicebot/quintero/ask_specialty_examples';
+}
+
+/**
+ * Mensaje de transferencia a agente con despedida
+ */
+export function transferAgent() {
+  return 'sound:voicebot/quintero/transfer_agent';
+}
+
+/**
  * Despedida genérica
  */
 export function farewell() {
-  return 'Muchas gracias, hasta luego.';
+  return 'sound:voicebot/quintero/farewell';
 }
 
 /**

@@ -45,7 +45,11 @@ export default async function checkAvailability(ctx, state) {
 
   // 🎯 PASO 2: DELEGAR GET_NEXT_AVAILABILITY AL WEBHOOK
   const availabilityResult = await getNextAvailability(rutFormatted, especialidad, sessionId);
+
+  // 📋 LOGGING DETALLADO DE WEBHOOK
   log("info", `[CHECK_AVAILABILITY] Webhook respuesta: ok=${availabilityResult.ok}, horaFound=${availabilityResult.horaFound}, reason=${availabilityResult.reason || 'none'}`);
+  log("info", `📋 [WEBHOOK][RAW] ${JSON.stringify(availabilityResult)}`);
+
 
   if (!availabilityResult.ok) {
     // Error técnico - Aquí sí cortamos porque es fallo de sistema
@@ -70,18 +74,18 @@ export default async function checkAvailability(ctx, state) {
 
     if (reason === 'SPECIALTY_NOT_MAPPED' || reason === 'NO_AVAILABILITY') {
       // NO_AVAILABILITY
-      log("info", `[CHECK_AVAILABILITY] No availability found via Webhook. Reason: ${reason}`);
-      // 🎯 TURNO 1: Notificación (Output Only)
+      log("info", `[CHECK_AVAILABILITY] No availability found. Transitioning to OFFER_ALTERNATIVES_INTRO`);
+
+      // 🎯 Transición a fase INTRO (solo TTS, sin escucha)
       return {
-        ttsText: tts.offerAnotherSpecialty(),
-        nextPhase: 'OFFER_ALTERNATIVES',
-        silent: false, // 🗣️ Engine habla
+        ttsText: null,  // Silent transition
+        nextPhase: 'OFFER_ALTERNATIVES_INTRO',
+        silent: true,
         action: {
           type: "SET_STATE",
           payload: {
             updates: {
-              rutPhase: 'OFFER_ALTERNATIVES',
-              alternativesAttempts: 0
+              rutPhase: 'OFFER_ALTERNATIVES_INTRO'
             }
           }
         }

@@ -15,18 +15,39 @@ import * as tts from '../tts/messages.js';
 export default async function offerAlternatives(ctx, state) {
     const { transcript } = ctx;
 
-    // Si no hay transcript (primera vez o silencio), esperar input
-    // Si no hay transcript (primera vez tras transición silenciosa), esperar input
-    if (!transcript) {
-        log("info", `[OFFER_ALTERNATIVES] Turno 2 (Escucha): Iniciando espera de voz`);
+    // Detectar si es la primera vez (sin transcript Y sin intentos previos)
+    const isFirstTime = !transcript && (state.alternativesAttempts === 0 || !state.alternativesAttempts);
+
+    if (isFirstTime) {
+        log("info", `[OFFER_ALTERNATIVES] Primera ejecución: Reproduciendo TTS inicial`);
+        state.alternativesAttempts = 1;
+
         return {
-            ttsText: null, // Ya se dijo el TTS en Turno 1
+            ttsText: tts.offerAnotherSpecialty(),
             nextPhase: 'OFFER_ALTERNATIVES',
-            silent: false, // 🎤 Engine escucha
+            shouldHangup: false,
             action: {
                 type: "SET_STATE",
                 payload: {
-                    updates: {} // No updates needed
+                    updates: {
+                        alternativesAttempts: 1
+                    }
+                }
+            }
+        };
+    }
+
+    // Si no hay transcript pero ya se preguntó antes, es silencio
+    if (!transcript) {
+        log("info", `[OFFER_ALTERNATIVES] Silencio detectado (intento ${state.alternativesAttempts})`);
+        return {
+            ttsText: null,
+            nextPhase: 'OFFER_ALTERNATIVES',
+            silent: false,
+            action: {
+                type: "SET_STATE",
+                payload: {
+                    updates: {}
                 }
             }
         };
