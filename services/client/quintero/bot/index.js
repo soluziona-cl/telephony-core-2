@@ -21,17 +21,8 @@ export default async function quinteroBot(ctx) {
     log("info", "🆕 [QUINTERO] Estado inicializado");
   }
 
-  // 🔌 TRANSCRIPTION LAYER (Domain Responsibility)
-  // The engine no longer transcribes. We must do it here if needed.
-  if ((!ctx.transcript || ctx.transcript.trim() === "") && ctx.audioPath && ctx.openai) {
-    try {
-      log("info", "🎤 [QUINTERO] Delegating transcription to OpenAI (Strict Mode)...");
-      ctx.transcript = await ctx.openai.transcribeAudioOnly(ctx.audioPath);
-      log("info", `📝 [QUINTERO] Transcript: "${ctx.transcript}"`);
-    } catch (err) {
-      log("error", `❌ [QUINTERO] Transcription error: ${err.message}`);
-    }
-  }
+  // 🔌 TRANSCRIPTION LAYER (Handled by Engine V3)
+  // Logic removed as Engine V3 guarantees transcript availability.
 
   // 🧠 RUT DOMAIN DELEGATION
   // If we are in a RUT phase, delegate to the generic RUT domain
