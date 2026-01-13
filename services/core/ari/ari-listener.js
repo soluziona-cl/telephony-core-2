@@ -711,7 +711,8 @@ AriClient.connect(
             await startVoiceBotSessionV3(ari, channel, ani, dnis, linkedId, mode, {
               domain: capsule,
               mode: mode,
-              botName: capsule ? 'Capsule' : 'Legacy'
+              botName: capsule ? 'Capsule' : 'Legacy',
+              state: {} // ✅ State persistence for V3 Engine
             });
           } catch (err) {
             log("error", `❌ Error iniciando VoiceBot V3: ${err.message}`);
