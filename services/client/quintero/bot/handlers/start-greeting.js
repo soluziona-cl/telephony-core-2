@@ -18,7 +18,7 @@ export default async function startGreeting(ctx, state) {
     return {
         audio: 'quintero/greeting_sofia_2',
         ttsText: null, // Ensure no TTS
-        nextPhase: 'WAIT_RUT_INPUT', // ✅ Correct Phase for RUT Domain v2
+        nextPhase: 'LISTEN_RUT', // ✅ Transition to explicit Listening phase
         silent: true, // 🔒 Disable listening during playback
         allowBargeIn: false,
         shouldHangup: false,

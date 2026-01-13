@@ -4,5 +4,7 @@ export const RUT_PHASES = {
     WAIT_DV: 'WAIT_DV',
     CONFIRM: 'CONFIRM',
     COMPLETE: 'COMPLETE',
-    ERROR: 'ERROR'
+    ERROR: 'ERROR',
+    LISTEN_RUT: 'LISTEN_RUT',
+    PROCESS_RUT: 'PROCESS_RUT'
 };

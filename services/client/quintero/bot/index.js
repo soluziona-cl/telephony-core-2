@@ -26,7 +26,7 @@ export default async function quinteroBot(ctx) {
 
   // 🧠 RUT DOMAIN DELEGATION
   // If we are in a RUT phase, delegate to the generic RUT domain
-  if (['INIT', 'WAIT_BODY', 'WAIT_DV', 'CONFIRM', 'ERROR'].includes(ctx.state.rutPhase)) {
+  if (['INIT', 'WAIT_BODY', 'WAIT_DV', 'CONFIRM', 'ERROR', 'WAIT_RUT_INPUT', 'HANDLE_FORMAT_RUT', 'HANDLE_VALIDATE_PATIENT', 'LISTEN_RUT', 'PROCESS_RUT'].includes(ctx.state.rutPhase)) {
     const rutResult = await rutDomain(ctx);
     // Merge state updates
     if (rutResult.action === 'SET_STATE' && rutResult.action.payload && rutResult.action.payload.updates) {
