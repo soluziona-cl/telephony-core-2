@@ -12,7 +12,7 @@
 import fs from "fs";
 import { exec } from "child_process";
 import { promisify } from "util";
-import { playWithBargeIn } from "./legacy/legacy-helpers.js";
+import { playWithBargeIn, waitForRealVoice } from "./legacy/legacy-helpers.js";
 import { SkipInputOrchestrator } from "./orchestration/skip-input-orchestrator.js";
 import { OpenAIRealtimeClientV3 } from "./openai-client.js";
 import { log } from "../../../lib/logger.js";
