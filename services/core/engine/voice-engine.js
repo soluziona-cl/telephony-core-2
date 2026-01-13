@@ -43,7 +43,7 @@ import { pollUntil } from "./async/polling.js";
 import { SkipInputOrchestrator } from "./orchestration/skip-input-orchestrator.js";
 import { StrictModeOrchestrator } from "./orchestration/strict-mode.js";
 import { NormalModeOrchestrator } from "./orchestration/normal-mode.js";
-import { flowTrace } from "./telemetry/flow-trace.js";
+import { flowTrace } from "../telemetry/flow-trace.js";
 
 // DB integration and RUT helpers are implemented in the query-enabled engine.
 
@@ -374,35 +374,34 @@ async function runModularEngine(ari, channel, ani, dnis, linkedId, promptFile, d
       } catch (err) {
         log('error', `❌ [MODULAR] Domain Logic Error: ${err.message}`);
       }
+    } else {
+      // 🔙 LEGACY FALLBACK REMOVED
+      // The engine now fully relies on Domain Capsules.
+      // If no domain is provided, it will strictly follow the prompt file or fail gracefully.
+      log('debug', `[MODULAR] No domain context - skipping business logic`);
     }
-  } else {
-    // 🔙 LEGACY FALLBACK REMOVED
-    // The engine now fully relies on Domain Capsules.
-    // If no domain is provided, it will strictly follow the prompt file or fail gracefully.
-    log('debug', `[MODULAR] No domain context - skipping business logic`);
-}
 
-return result;
+    return result;
   };
 
-// 7. Run Loop
-try {
-  await runner.runLoop(
-    session,
-    channel,
-    openaiClient,
-    domainProcessor,
-    conversationState,
-    audioState,
-    businessState
-  );
-} catch (err) {
-  log('error', `❌ [MODULAR ENGINE] Fatal: ${err.message}`);
-} finally {
-  openaiClient.disconnect();
-  log('info', `🔚 [MODULAR ENGINE] Session ended`);
-  await finalizeCallStorage(ari, channel, ani, dnis, linkedId, conversationState, audioState, businessState).catch(e => log('error', e.message));
-}
+  // 7. Run Loop
+  try {
+    await runner.runLoop(
+      session,
+      channel,
+      openaiClient,
+      domainProcessor,
+      conversationState,
+      audioState,
+      businessState
+    );
+  } catch (err) {
+    log('error', `❌ [MODULAR ENGINE] Fatal: ${err.message}`);
+  } finally {
+    openaiClient.disconnect();
+    log('info', `🔚 [MODULAR ENGINE] Session ended`);
+    await finalizeCallStorage(ari, channel, ani, dnis, linkedId, conversationState, audioState, businessState).catch(e => log('error', e.message));
+  }
 }
 
 // ---------------------------------------------------------

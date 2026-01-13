@@ -1,7 +1,7 @@
 import fs from "fs";
 import { exec } from "child_process";
 import { promisify } from "util";
-import { log } from "../../../../../lib/logger.js";
+import { log } from "../../../../lib/logger.js";
 import { waitPlaybackFinished } from "../async/waiters.js";
 import { inboundConfig as config } from "../config.js";
 

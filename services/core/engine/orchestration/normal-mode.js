@@ -1,5 +1,5 @@
 import fs from "fs";
-import { log } from "../../../../../lib/logger.js";
+import { log } from "../../../../lib/logger.js";
 import { Guardrails } from "../policies/guardrails.js";
 import { processUserTurnWithOpenAI, playWithBargeIn } from "../legacy/legacy-helpers.js";
 import { runBusinessLogic } from "../legacy/legacy-business.js";
