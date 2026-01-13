@@ -32,8 +32,12 @@ export async function startVoiceBotSessionV3(
 
     const conversationState = {
         history: [],
-        terminated: false
+        terminated: false,
+        startTime: new Date()
     };
+
+    // Ensure domain state is initialized
+    domainContext.state = domainContext.state || {};
 
     const openaiClient = new OpenAIRealtimeClientV3({
         voice: config.openai.voice,
@@ -56,27 +60,39 @@ export async function startVoiceBotSessionV3(
     });
 
     // =======================================================
-    // TURN 0 — GREETING (DOMAIN OWNED)
+    // 🚀 INITIALIZATION (INIT EVENT)
     // =======================================================
     try {
-        const greetCtx = buildDomainCtx("", domainContext, ari, channel, ani, dnis, linkedId);
-        const greetResult = await domainContext.domain(greetCtx);
+        const initCtx = buildDomainCtx("", domainContext, ari, channel, ani, dnis, linkedId);
 
-        applyDomainResult(greetResult, openaiClient, conversationState, ari, channel);
-        if (greetResult?.shouldHangup) {
+        // 1️⃣ SEND INIT EVENT
+        log("info", `📢 [ENGINE] Sending INIT event`);
+        const initResult = await domainContext.domain({
+            ...initCtx,
+            event: 'INIT'
+        });
+
+        // 2️⃣ UPDATE STATE & APPLY RESULT
+        if (initResult && initResult.state) {
+            domainContext.state = initResult.state;
+        }
+
+        await applyDomainResult(initResult, openaiClient, conversationState, ari, channel);
+
+        if (initResult?.shouldHangup || initResult?.action === 'HANGUP') {
             engineState.active = false;
         }
+
     } catch (err) {
-        log("error", `❌ Greeting error: ${err.message}`);
+        log("error", `❌ Init error: ${err.message}`);
         engineState.active = false;
     }
 
     // =======================================================
-    // MAIN LOOP
+    // 🔄 MAIN LOOP
     // =======================================================
     while (engineState.active && engineState.turn < MAX_TURNS) {
         engineState.turn++;
-
         log("info", `🔄 Turn ${engineState.turn}`);
 
         const voiceDetected = await waitForRealVoice(channel, {
@@ -92,7 +108,7 @@ export async function startVoiceBotSessionV3(
                 break;
             }
 
-            await delegateDomainSilence(domainContext, openaiClient, conversationState, ari, channel, ani, dnis, linkedId);
+            await delegateDomainEvent('NO_INPUT', domainContext, openaiClient, conversationState, ari, channel, ani, dnis, linkedId);
             continue;
         }
 
@@ -107,7 +123,7 @@ export async function startVoiceBotSessionV3(
         const stats = fs.statSync(rec.path);
         if (stats.size < MIN_AUDIO_BYTES) {
             log("warn", `🤫 Audio too small (${stats.size} bytes)`);
-            await delegateDomainSilence(domainContext, openaiClient, conversationState, ari, channel, ani, dnis, linkedId);
+            await delegateDomainEvent('NO_INPUT', domainContext, openaiClient, conversationState, ari, channel, ani, dnis, linkedId);
             continue;
         }
 
@@ -115,12 +131,21 @@ export async function startVoiceBotSessionV3(
         await openaiClient.processAudio(rec.path);
         const transcript = await openaiClient.waitForTranscript();
 
+        // 3️⃣ REGULAR TURN
         const ctx = buildDomainCtx(transcript, domainContext, ari, channel, ani, dnis, linkedId);
-        const domainResult = await domainContext.domain(ctx);
+        const domainResult = await domainContext.domain({
+            ...ctx,
+            event: 'TURN'
+        });
 
-        applyDomainResult(domainResult, openaiClient, conversationState, ari, channel);
+        // UPDATE STATE
+        if (domainResult && domainResult.state) {
+            domainContext.state = domainResult.state;
+        }
 
-        if (domainResult?.shouldHangup) {
+        await applyDomainResult(domainResult, openaiClient, conversationState, ari, channel);
+
+        if (domainResult?.shouldHangup || domainResult?.action === 'HANGUP') {
             engineState.active = false;
             break;
         }
@@ -157,21 +182,61 @@ function buildDomainCtx(transcript, domainContext, ari, channel, ani, dnis, link
     };
 }
 
-async function delegateDomainSilence(domainContext, openaiClient, conversationState, ari, channel, ani, dnis, linkedId) {
+async function delegateDomainEvent(eventType, domainContext, openaiClient, conversationState, ari, channel, ani, dnis, linkedId) {
     const ctx = buildDomainCtx("", domainContext, ari, channel, ani, dnis, linkedId);
-    const result = await domainContext.domain(ctx);
-    applyDomainResult(result, openaiClient, conversationState, ari, channel);
-}
+    const result = await domainContext.domain({
+        ...ctx,
+        event: eventType
+    });
 
-function applyDomainResult(result, openaiClient, conversationState, ari, channel) {
-    if (!result) return;
-
-    if (result.ttsText) {
-        openaiClient.sendSystemText(result.ttsText);
-        conversationState.history.push({ role: "assistant", content: result.ttsText });
+    if (result && result.state) {
+        domainContext.state = result.state;
     }
 
-    if (result.soundFile) {
-        playWithBargeIn(ari, channel, result.soundFile, openaiClient, { bargeIn: false });
+    await applyDomainResult(result, openaiClient, conversationState, ari, channel);
+}
+
+async function applyDomainResult(result, openaiClient, conversationState, ari, channel) {
+    if (!result) return;
+
+    // NORMALIZE ACTION
+    // Handles { action: 'PLAY_AUDIO', audio: 'path' } vs { action: 'SAY_TEXT', text: '...' }
+    // Also supports legacy formats for backward compatibility via 'adapter' logic if strictly needed,
+    // but we prefer strict here.
+
+    const action = result.action || 'WAIT_INPUT'; // Default
+
+    // 1. AUDIO PLAYBACK (Implicit or Explicit)
+    const audioFile = result.audio || result.soundFile;
+    if (action === 'PLAY_AUDIO' || audioFile) {
+        if (audioFile) {
+            log("info", `▶️ Playing Audio: ${audioFile}`);
+            await playWithBargeIn(ari, channel, audioFile, openaiClient, { bargeIn: true });
+        }
+    }
+
+    // 2. TTS / TEXT (Implicit or Explicit)
+    const textToSay = result.text || result.ttsText;
+    if ((action === 'SAY_TEXT' || textToSay) && !audioFile) {
+        // Only say text if no audio file was provided (priority to audio)
+        // OR if action explicitly allows it.
+        // For now, consistent with legacy: if text exists, send it.
+        // BUT strict mode: 'sound:...' should be handled by domain returning audio property, not ttsText.
+
+        if (textToSay) {
+            // Guardrail: Detect "sound:" in text and block it
+            if (textToSay.startsWith("sound:")) {
+                log("warn", `⚠️ [ENGINE] Domain returned 'sound:' in text. This should be 'audio' property. Ignoring TTS.`);
+            } else {
+                log("info", `🗣️ TTS: "${textToSay}"`);
+                openaiClient.sendSystemText(textToSay);
+                conversationState.history.push({ role: "assistant", content: textToSay });
+            }
+        }
+    }
+
+    // 3. HANGUP
+    if (action === 'HANGUP' || result.shouldHangup) {
+        log("info", "🛑 Domain requested HANGUP");
     }
 }

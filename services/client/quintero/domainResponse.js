@@ -14,6 +14,7 @@ export function normalizeDomainResponse(resp, fallbackPhase) {
     return {
         nextPhase: r.nextPhase ?? fallbackPhase ?? 'WAIT_BODY',
         ttsText: (typeof r.ttsText === 'string') ? r.ttsText : null,
+        audio: (typeof r.audio === 'string') ? r.audio : null,
         silent: typeof r.silent === 'boolean' ? r.silent : false,
         skipUserInput: typeof r.skipUserInput === 'boolean' ? r.skipUserInput : false,
         action: r.action ?? { type: 'SET_STATE' }, // Default action is safe state update or no-op
@@ -41,6 +42,9 @@ export function assertDomainResponse(resp) {
 
     // ttsText must be string or null
     if (!(resp.ttsText === null || typeof resp.ttsText === 'string')) errors.push('ttsText_invalid');
+
+    // audio must be string or null/undefined
+    if (resp.audio !== undefined && resp.audio !== null && typeof resp.audio !== 'string') errors.push('audio_invalid');
 
     return errors;
 }

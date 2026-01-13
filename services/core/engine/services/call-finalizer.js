@@ -21,16 +21,17 @@ export class CallFinalizer {
      */
     static async finalize(ari, channel, session, audioState, businessState) {
         try {
+            const startTime = session.startTime || new Date();
             const endTime = new Date();
-            const duration = Math.round((endTime - session.startTime) / 1000);
+            const duration = Math.round((endTime - startTime) / 1000);
 
             // 1. Generate Conversation Log
-            const transcriptText = session.history
+            const transcriptText = (session.history || [])
                 .map(entry => entry.role === 'user' ? `👤 Usuario: ${entry.content}` : `🤖 Asistente: ${entry.content}`)
                 .join('\n');
 
             // 2. Prepare Paths and Metadata
-            const unixTime = Math.floor(session.startTime.getTime() / 1000);
+            const unixTime = Math.floor(startTime.getTime() / 1000);
             // Defensive check for DNI/ANI
             const safeDni = businessState.dni ? businessState.dni.replace(/[^0-9Kk]/g, '') : 'UNKNOWN';
             const safeAni = session.ani || 'UNKNOWN';
@@ -65,7 +66,7 @@ export class CallFinalizer {
             }, 5000);
 
             // 5. Persist to SQL Server
-            await this.persistToSql(session, endTime, safeAni, safeDnis, finalFileName, transcriptText, businessState, audioState);
+            await this.persistToSql(session, startTime, endTime, safeAni, safeDnis, finalFileName, transcriptText, businessState, audioState);
 
         } catch (err) {
             log("error", `❌ [FINALIZE] Error fatal en CallFinalizer: ${err.message}`);
@@ -104,7 +105,7 @@ export class CallFinalizer {
     /**
      * Executes the stored procedure to save call details.
      */
-    static async persistToSql(session, endTime, ani, dnis, finalFileName, transcriptText, businessState, audioState) {
+    static async persistToSql(session, startTime, endTime, ani, dnis, finalFileName, transcriptText, businessState, audioState) {
         try {
             // 🛡️ GUARD: Identificador is mandatory for sp_GuardarGestionLlamada
             const identificador = businessState.identificador || session.sessionId; // Fallback to sessionId/linkedId if acceptable, otherwise strict check? 
@@ -120,7 +121,7 @@ export class CallFinalizer {
             const pool = await poolPromise;
             if (pool) {
                 await pool.request()
-                    .input('FechaHoraInicio', sql.DateTime, session.startTime)
+                    .input('FechaHoraInicio', sql.DateTime, startTime)
                     .input('FechaHoraTermino', sql.DateTime, endTime)
                     .input('Agente', sql.NVarChar, 'VoiceBot')
                     .input('ANI', sql.NVarChar, ani)

@@ -33,6 +33,23 @@ export default async function quinteroAdapter(ctx) {
             result.action = { type: 'END_CALL', payload: { reason: 'LEGACY_SHOULD_HANGUP' } };
         }
 
+        // 🔄 MAPEO LEGACY -> STRICT CONTRACT
+        // Detectar si ttsText es en realidad un archivo de audio (Legacy pattern: "sound:path")
+        if (result.ttsText && result.ttsText.startsWith('sound:')) {
+            let soundPath = result.ttsText.replace('sound:', '').trim();
+            // Remove 'voicebot/' prefix if present, as legacy-helpers adds it back
+            if (soundPath.startsWith('voicebot/')) {
+                soundPath = soundPath.replace('voicebot/', '');
+            }
+
+            result.audio = soundPath;
+            result.action = 'PLAY_AUDIO'; // Override action to strict audio playback
+            result.ttsText = null;        // Clear TTS to prevent engine confusion
+            log("info", `🔄 [ADAPTER] Mapped legacy 'sound:' to action='PLAY_AUDIO'`, { audio: soundPath });
+        } else if (result.ttsText && !result.action) {
+            result.action = 'SAY_TEXT';
+        }
+
         const normalized = normalizeDomainResponse(result, ctx.state?.rutPhase);
         const errs = assertDomainResponse(normalized);
 
@@ -44,16 +61,22 @@ export default async function quinteroAdapter(ctx) {
                 ttsText: 'Disculpe, hubo un error técnico. ¿Podría repetir?',
                 silent: false,
                 skipUserInput: false,
-                action: { type: 'SET_STATE' }
+                action: { type: 'SET_STATE' },
+                state: ctx.state // Preserve state
             });
         }
 
         log("debug", "🌉 [CAPSULE] Exiting Quintero Adapter", {
             phase: normalized.nextPhase,
-            tts: normalized.ttsText ? 'YES' : 'NO'
+            tts: normalized.ttsText ? 'YES' : 'NO',
+            action: normalized.action
         });
 
-        return normalized;
+        // Ensure state is returned for engine persistence
+        return {
+            ...normalized,
+            state: result.state || ctx.state
+        };
 
     } catch (error) {
         log("error", "🌉 💥 [CAPSULE] Error inside Quintero Adapter", error);
