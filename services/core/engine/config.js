@@ -5,6 +5,10 @@ export const inboundConfig = {
 
     mode: "inbound",
 
+    engine: {
+        traceFlow: true
+    },
+
     bargeIn: {
         enabled: true,
         minUserAudioMs: 1500,

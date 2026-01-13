@@ -2,6 +2,7 @@
  * 🤖 Bot Quintero - Entry Point
  * Bot de identificación por RUT para Consultorio Médico de Quintero
  */
+import { rutDomain } from '../../../domains/rut/index.js';
 
 import { log } from '../../../../lib/logger.js';
 import { initialState, runState } from './state-machine.js';
@@ -20,7 +21,18 @@ export default async function quinteroBot(ctx) {
     log("info", "🆕 [QUINTERO] Estado inicializado");
   }
 
-  // Ejecutar state machine
+  // 🧠 RUT DOMAIN DELEGATION
+  // If we are in a RUT phase, delegate to the generic RUT domain
+  if (['INIT', 'WAIT_BODY', 'WAIT_DV', 'CONFIRM', 'ERROR'].includes(ctx.state.rutPhase)) {
+    const rutResult = await rutDomain(ctx);
+    // Merge state updates
+    if (rutResult.action === 'SET_STATE' && rutResult.action.payload && rutResult.action.payload.updates) {
+      ctx.state = { ...ctx.state, ...rutResult.action.payload.updates };
+    }
+    return { ...rutResult, state: ctx.state };
+  }
+
+  // Ejecutar state machine (Resto de Quintero)
   const result = await runState(ctx, ctx.state);
 
   // Retornar resultado con estado actualizado

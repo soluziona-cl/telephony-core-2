@@ -62,18 +62,8 @@ export async function getNextAppointment(patientId) {
 }
 
 export async function getAvailabilityBySpecialty(especialidad, fecha) {
-  try {
-    const pool = await _poolPromise;
-    const result = await pool
-      .request()
-      .input('esp', sql.VarChar, especialidad)
-      .input('fecha', sql.Date, fecha)
-      .execute('dbo.sp_GetAvailabilityBySpecialty');
-    return (result && result.recordset) || [];
-  } catch (err) {
-    log('error', `getAvailabilityBySpecialty error: ${err.message}`);
-    return [];
-  }
+  const { getAvailabilityBySpecialty: repoGetAvail } = await import('../../../domains/agenda/agenda.repository.js');
+  return repoGetAvail(especialidad, fecha);
 }
 
 /**
@@ -82,66 +72,17 @@ export async function getAvailabilityBySpecialty(especialidad, fecha) {
  * @param {string} sessionId 
  */
 export async function getAndHoldNextSlot(especialidad, sessionId) {
-  try {
-    const pool = await _poolPromise;
-    const result = await pool
-      .request()
-      .input('Especialidad', sql.VarChar, especialidad)
-      .input('SessionId', sql.VarChar, sessionId)
-      .input('HoldSeconds', sql.Int, 300) // 5 minutos de holgura
-      // Reemplazamos SP por Query Directa para asegurar "Próxima Disponible" >= Hoy
-      // y soportar la tabla CLI_QUINTEROS_disponibilidad_horas
-      .query(`
-        UPDATE TOP(1) CLI_QUINTEROS_disponibilidad_horas
-        SET HoldUntil = DATEADD(second, @HoldSeconds, GETDATE()), 
-            SessionId = @SessionId
-        OUTPUT inserted.*
-        WHERE especialidad = @Especialidad
-          AND (Estado = 'DISPONIBLE' OR Estado IS NULL) 
-          AND (HoldUntil IS NULL OR HoldUntil < GETDATE())
-          AND fecha >= CAST(GETDATE() AS DATE)
-          -- Ordenar por fecha y hora para obtener la más próxima real
-          -- Nota: Si hora_disponible es solo hora, el orden fecha, hora funciona.
-        `);
-
-
-    const row = (result && result.recordset && result.recordset[0]) || null;
-    if (!row || row.status === 'fail') return null;
-    return row;
-  } catch (err) {
-    log('error', `getAndHoldNextSlot error: ${err.message}`);
-    return null;
-  }
+  // Delegate to new Agenda Repository
+  const { getAndHoldNextSlot: repoGetAndHold } = await import('../../../domains/agenda/agenda.repository.js');
+  return repoGetAndHold(especialidad, sessionId);
 }
 
 /**
- * Scheduling placeholder: scheduling logic depends on the target table and locking strategy.
+ * Scheduling callback.
  */
 export async function scheduleAppointment(patientIdOrRut, fechaHora, especialidad, source = 'voicebot', sessionId = null) {
-  try {
-    const pool = await _poolPromise;
-
-    let pid = null;
-    let prut = null;
-    if (typeof patientIdOrRut === 'number') pid = patientIdOrRut;
-    else if (typeof patientIdOrRut === 'string') prut = patientIdOrRut;
-
-    const req = pool.request();
-    req.input('PatientId', sql.Int, pid);
-    req.input('PatientRut', sql.VarChar, prut);
-    req.input('FechaHora', sql.DateTime, fechaHora);
-    req.input('Especialidad', sql.VarChar, especialidad);
-    req.input('Source', sql.VarChar, source);
-    req.input('SessionId', sql.VarChar, sessionId);
-
-    const res = await req.execute('dbo.sp_ScheduleAppointment');
-    const row = (res && res.recordset && res.recordset[0]) || null;
-    if (!row) return { ok: false, error: 'no_result' };
-    return { ok: (row.status && row.status.toString().toLowerCase() === 'ok') || false, id: row.id || null, disponibilidadId: row.disponibilidadId || null };
-  } catch (err) {
-    log('error', `scheduleAppointment error: ${err.message}`);
-    return { ok: false, error: err.message };
-  }
+  const { scheduleAppointment: repoSchedule } = await import('../../../domains/agenda/agenda.repository.js');
+  return repoSchedule({ patientIdOrRut, fechaHora, especialidad, source, sessionId });
 }
 
 /**

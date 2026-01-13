@@ -34,7 +34,6 @@ import { EngineLogger } from "./telemetry/engine-logger.js";
 import { PhaseManager } from "./core/phase-manager.js";
 import { playGreeting, playStillTherePrompt, recordUserTurn, sendSystemTextAndPlay, sendBvdaText, extractRutCandidate } from "./legacy/legacy-helpers.js";
 import { shouldTransferToQueue, transferToQueue } from "./domain/transfers.js";
-import { handleRutState, runBusinessLogic } from "./legacy/legacy-business.js";
 import { executeDomainAction } from "./legacy/legacy-actions.js";
 import { PHASES, isSilentPhase } from "./domain/phases.js";
 import { Guardrails } from "./policies/guardrails.js";
@@ -44,6 +43,7 @@ import { pollUntil } from "./async/polling.js";
 import { SkipInputOrchestrator } from "./orchestration/skip-input-orchestrator.js";
 import { StrictModeOrchestrator } from "./orchestration/strict-mode.js";
 import { NormalModeOrchestrator } from "./orchestration/normal-mode.js";
+import { flowTrace } from "./telemetry/flow-trace.js";
 
 // DB integration and RUT helpers are implemented in the query-enabled engine.
 
@@ -119,6 +119,18 @@ const QUEUES_NAME = config.queues.nameQueue;
 async function runModularEngine(ari, channel, ani, dnis, linkedId, promptFile, domainContext = null) {
   log('info', `🔧 [MODULAR ENGINE] Starting session for ${linkedId}`);
 
+  flowTrace({
+    traceId: linkedId,
+    layer: 'ENGINE',
+    flow: 'INIT',
+    step: 'START_SESSION',
+    depth: 1,
+    module: 'voice-engine.js',
+    fn: 'runModularEngine',
+    action: 'INIT_SESSION',
+    result: 'START'
+  });
+
   // 1. Session & Modules
   const session = new SessionContext(linkedId, ani, dnis);
   const logger = new EngineLogger(session);
@@ -187,23 +199,19 @@ async function runModularEngine(ari, channel, ani, dnis, linkedId, promptFile, d
     return false;
   }
 
-  const businessState = {
+  // 🧠 BUSINESS STATE OWNERSHIP: Domain decides initial state
+  let businessState = {
     rutPhase: 'NONE',
-    rutBody: null,
-    rutDv: null,
-    rutFormatted: null,
-    rutAttempts: 0,
-    dni: null,
-    patient: null,
-    nombre_paciente: null,
-    specialty: null,
-    especialidad: null,
-    fecha_hora: null,
-    doctor_box: null,
-    heldSlot: null,
-    requiresStrictTts: false,
     disableBargeIn: botDisablesBargeIn(promptFile)
   };
+
+  if (domainContext && typeof domainContext.initialState === 'function') {
+    log('info', '🧩 [MODULAR] Initializing State from Domain');
+    const domainState = domainContext.initialState();
+    businessState = { ...businessState, ...domainState };
+  } else if (domainContext && domainContext.initialState && typeof domainContext.initialState === 'object') {
+    businessState = { ...businessState, ...domainContext.initialState };
+  }
 
   // 4. OpenAI & Prompting
   function promptRequiresDb(promptFileName) {
@@ -245,16 +253,59 @@ async function runModularEngine(ari, channel, ani, dnis, linkedId, promptFile, d
   await openaiClient.connect();
 
   // 5. Greeting
-  const botConfig = config.bots[`voicebot_${promptFile.replace('.txt', '')}`] || config.bots['voicebot'] || {};
-  try {
-    if (botConfig.greetingFile || botConfig.greetingText) {
-      businessState.rutPhase = 'WAIT_BODY';
-      await playGreeting(ari, channel, openaiClient, botConfig, conversationState);
-      log('info', '✅ [MODULAR] Greeting completed');
-      await technicalWorkaroundDelay();
+  // 5. Greeting
+  if (domainContext && domainContext.domain) {
+    log("info", "🌉 [MODULAR] Delegating Greeting to Domain (Turn 0)");
+    const ctx = {
+      transcript: "",
+      sessionId: linkedId,
+      ani,
+      dnis,
+      botName: domainContext.botName || 'default',
+      state: businessState,
+      ari,
+      channel
+    };
+
+    try {
+      const greetingResult = await domainContext.domain(ctx);
+      if (ctx.state) Object.assign(businessState, ctx.state);
+
+      if (greetingResult.ttsText) {
+        if (greetingResult.ttsText.startsWith('sound:')) {
+          const soundId = greetingResult.ttsText.replace('sound:voicebot/', '');
+          await playWithBargeIn(ari, channel, soundId, openaiClient, { bargeIn: false });
+        } else {
+          // TTS dinámico
+          const audioBuffer = await openaiClient.sendSystemText(greetingResult.ttsText);
+          if (audioBuffer && audioBuffer.length > 0) {
+            const rspId = `vb_greeting_${Date.now()}`;
+            const rawPcmFile = `/tmp/${rspId}.pcm`;
+            const finalWavFile = `${VOICEBOT_PATH}/${rspId}.wav`;
+            fs.writeFileSync(rawPcmFile, audioBuffer);
+            const cmd = `ffmpeg -y -f s16le -ar 24000 -ac 1 -i "${rawPcmFile}" -ar 8000 -ac 1 -c:a pcm_s16le "${finalWavFile}"`;
+            await execAsync(cmd);
+            await playWithBargeIn(ari, channel, rspId, openaiClient, { bargeIn: false });
+          }
+        }
+        if (conversationState) conversationState.history.push({ role: 'assistant', content: greetingResult.ttsText });
+      }
+    } catch (err) {
+      log('error', `⚠️ [MODULAR] Domain Greeting Error: ${err.message}`);
     }
-  } catch (err) {
-    log('warn', `⚠️ [MODULAR] Greeting error: ${err.message}`);
+  } else {
+    // Legacy Greeting
+    const botConfig = config.bots[`voicebot_${promptFile.replace('.txt', '')}`] || config.bots['voicebot'] || {};
+    try {
+      if (botConfig.greetingFile || botConfig.greetingText) {
+        businessState.rutPhase = 'WAIT_BODY';
+        await playGreeting(ari, channel, openaiClient, botConfig, conversationState);
+        log('info', '✅ [MODULAR] Legacy Greeting completed');
+        await technicalWorkaroundDelay();
+      }
+    } catch (err) {
+      log('warn', `⚠️ [MODULAR] Legacy Greeting error: ${err.message}`);
+    }
   }
 
   // 6. Domain Processor Adapter
@@ -270,41 +321,88 @@ async function runModularEngine(ari, channel, ani, dnis, linkedId, promptFile, d
     conversationState.history.push({ role: 'user', content: transcript });
     conversationState.history.push({ role: 'assistant', content: assistantResponse });
 
-    // Existing Business Logic invocation
-    // We pass the legacy variables to maintain compatibility with existing business logic functions
-    try {
-      await runBusinessLogic(transcript, assistantResponse, businessState, conversationState, ari, channel, openaiClient, linkedId);
-    } catch (err) {
-      log('warn', `⚠️ [MODULAR] Business logic error: ${err.message}`);
-    }
-
-    return {
+    let result = {
       responseFile: responseBaseName,
       assistantResponse: assistantResponse,
       transcript: transcript,
-      critical: /rut|confirmar|registrado/i.test(assistantResponse),
+      critical: false,
       nextPhase: businessState.rutPhase || session.currentPhase
     };
+
+    // 🧠 DOMAIN DELEGATION
+    if (domainContext && domainContext.domain) {
+      try {
+        const ctx = {
+          transcript,
+          sessionId: linkedId,
+          ani,
+          dnis,
+          botName: domainContext.botName || 'default',
+          state: businessState,
+          ari,
+          channel
+        };
+
+        flowTrace({
+          traceId: linkedId,
+          layer: 'ENGINE',
+          flow: businessState.rutPhase || 'UNKNOWN',
+          step: session.currentPhase,
+          depth: 1,
+          module: 'voice-engine.js',
+          fn: 'runLoop',
+          action: 'DELEGATE_DOMAIN',
+          result: domainContext.botName || 'domain'
+        });
+
+        const domainResult = await domainContext.domain(ctx);
+
+        // Domain State Update
+        if (ctx.state) Object.assign(businessState, ctx.state);
+
+        // Engine Contract Fulfillment
+        if (domainResult.ttsText) {
+          await openaiClient.sendSystemText(domainResult.ttsText);
+          conversationState.history.push({ role: 'assistant', content: domainResult.ttsText });
+        }
+        if (domainResult.shouldHangup) {
+          conversationState.terminated = true;
+        }
+        result.nextPhase = domainResult.nextPhase || businessState.rutPhase;
+        result.critical = false; // Domain handles logic
+
+      } catch (err) {
+        log('error', `❌ [MODULAR] Domain Logic Error: ${err.message}`);
+      }
+    }
+  } else {
+    // 🔙 LEGACY FALLBACK REMOVED
+    // The engine now fully relies on Domain Capsules.
+    // If no domain is provided, it will strictly follow the prompt file or fail gracefully.
+    log('debug', `[MODULAR] No domain context - skipping business logic`);
+}
+
+return result;
   };
 
-  // 7. Run Loop
-  try {
-    await runner.runLoop(
-      session,
-      channel,
-      openaiClient,
-      domainProcessor,
-      conversationState,
-      audioState,
-      businessState
-    );
-  } catch (err) {
-    log('error', `❌ [MODULAR ENGINE] Fatal: ${err.message}`);
-  } finally {
-    openaiClient.disconnect();
-    log('info', `🔚 [MODULAR ENGINE] Session ended`);
-    await finalizeCallStorage(ari, channel, ani, dnis, linkedId, conversationState, audioState, businessState).catch(e => log('error', e.message));
-  }
+// 7. Run Loop
+try {
+  await runner.runLoop(
+    session,
+    channel,
+    openaiClient,
+    domainProcessor,
+    conversationState,
+    audioState,
+    businessState
+  );
+} catch (err) {
+  log('error', `❌ [MODULAR ENGINE] Fatal: ${err.message}`);
+} finally {
+  openaiClient.disconnect();
+  log('info', `🔚 [MODULAR ENGINE] Session ended`);
+  await finalizeCallStorage(ari, channel, ani, dnis, linkedId, conversationState, audioState, businessState).catch(e => log('error', e.message));
+}
 }
 
 // ---------------------------------------------------------
