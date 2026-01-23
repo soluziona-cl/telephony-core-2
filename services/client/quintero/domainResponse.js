@@ -19,6 +19,9 @@ export function normalizeDomainResponse(resp, fallbackPhase) {
         skipUserInput: typeof r.skipUserInput === 'boolean' ? r.skipUserInput : false,
         action: r.action ?? { type: 'SET_STATE' }, // Default action is safe state update or no-op
         statePatch: r.statePatch ?? null,
+        // 🎯 CONTRATO INCREMENTAL: Preservar flags del dominio
+        enableIncremental: r.enableIncremental,
+        disableIncremental: r.disableIncremental,
     };
 }
 

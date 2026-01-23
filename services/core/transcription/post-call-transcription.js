@@ -47,7 +47,11 @@ async function start() {
 async function processBatchTranscription(openai, linkedId, ani, dnis, timestamp) {
     try {
         const date = new Date(timestamp);
-        const yyyymmdd = date.toISOString().split('T')[0].replace(/-/g, '');
+        // Usar zona horaria local (America/Santiago) en lugar de UTC
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        const yyyymmdd = `${year}${month}${day}`;
 
         // 2. Localizar grabación MASTER (Capa A)
         const mixName = `${linkedId}_${ani}_${dnis}_mix.wav`;

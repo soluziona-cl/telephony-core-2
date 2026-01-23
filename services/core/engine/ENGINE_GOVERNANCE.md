@@ -1,3 +1,4 @@
+
 # 🦅 INSTRUCCIÓN OFICIAL DE MODIFICACIÓN — VOICEBOT ENGINE V3
 
 **Clasificación**: 🔴 Mission-Critical Fix
@@ -44,11 +45,37 @@ if (session.terminated) {
 }
 ```
 
+## 🔒 REGLAS DE PODER - AUDIO & SNOOP (NO NEGOCIABLES)
+
+### 🔴 REGLA V3-A01 — GOLDEN RULE: AUDIO_READY
+### 🔴 REGLA V3-A01 — GOLDEN RULE: AUDIO_READY (UPDATED)
+La definición de "Audio Listo" depende del tipo de fuente:
+
+**A. Para Snoop RX (Canales espía)**:
+- **Fuente de Verdad**: `StasisStart` recibido (Contrato == READY).
+- **Validación Física**: ❌ PROHIBIDA (`channels.get()` no es confiable para canales app-snoop).
+- **Criterio**: Si el contrato dice READY, el audio está fluyendo.
+
+**B. Para Canales Directos (Caller)**:
+- **Fuente de Verdad**: `channels.get() === Up`.
+
+```javascript
+// Implementación Canónica Actualizada
+if (isSnoop) {
+   // Trust Contract Only
+   if (contract.state === READY) proceed();
+} else {
+   // Trust Physical
+   if (channel.state === Up) proceed();
+}
+```
+
 ## 🧪 CRITERIOS DE ACEPTACIÓN
 1. El texto final se escucha una sola vez.
 2. La llamada se corta inmediatamente al terminar el audio.
 3. No existen logs después de END_CALL.
 4. No hay warnings de "Channel not found".
+5. STT inicia en <300ms tras el saludo (sin retries de 500ms).
 
 ---
 

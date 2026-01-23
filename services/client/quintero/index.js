@@ -10,3 +10,6 @@ export const botName = 'quintero';
 
 // Exported for testing/verification
 export const initialGreeting = tts.askRut();
+
+export { config } from './config.js';
+

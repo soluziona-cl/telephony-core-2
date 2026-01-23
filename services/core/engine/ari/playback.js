@@ -8,12 +8,15 @@
  */
 
 import { log } from '../../../../lib/logger.js';
+import { shouldInterrupt } from '../contracts/interrupt-policy.contract.js';
 
 export class PlaybackModule {
     constructor(ari, config = {}) {
         this.ari = ari;
         this.playbackTimeoutMs = config.playbackTimeoutMs || 30000;
-        this.talkingDebounceMs = config.talkingDebounceMs || 300;
+        // 🎯 MEJORA FLUIDEZ: Barge-in más rápido (< 150ms objetivo)
+        // Reducido de 300ms a 100ms para detección más rápida, con mínimo de 50ms para evitar falsos positivos
+        this.talkingDebounceMs = config.talkingDebounceMs || 100;
         this.voicebotPath = config.voicebotPath || '/var/lib/asterisk/sounds/voicebot';
     }
 
@@ -41,40 +44,81 @@ export class PlaybackModule {
             return { reason: 'channel_not_found' };
         }
 
-        const allowBargeIn = options.bargeIn !== false;
+        // ✅ ARQUITECTURA DESACOPLADA: Usar interruptPolicy si está disponible
+        const interruptPolicy = options.interruptPolicy || {
+            allowBargeIn: options.bargeIn !== false,
+            minSpeechMs: 400,
+            minConfidence: 0.6,
+            ignoreIfOnlyNoise: true
+        };
+        const allowBargeIn = interruptPolicy.allowBargeIn;
+        
         const media = `sound:voicebot/${fileBaseName}`;
         const playback = this.ari.Playback();
 
-        log('info', `🔊 [PLAYBACK] Playing (barge-in ${allowBargeIn ? 'enabled' : 'disabled'}): ${media}`);
+        log('info', `🔊 [PLAYBACK] Playing (interruptPolicy: allowBargeIn=${allowBargeIn}, minSpeechMs=${interruptPolicy.minSpeechMs}, minConfidence=${interruptPolicy.minConfidence}): ${media}`);
         if (openaiClient) openaiClient.isPlaybackActive = true;
 
         return new Promise((resolve) => {
             let bargedIn = false;
             let finished = false;
             let talkingTimer = null;
+            let speechStartTime = null;
             const startedAt = Date.now();
 
             const talkingHandler = (event, chan) => {
                 if (!chan || chan.id !== channel.id) return;
                 if (finished || !allowBargeIn) return;
 
+                // ✅ ARQUITECTURA DESACOPLADA: Evaluar interrupción por intención
+                // Si tenemos datos de STT disponibles, usarlos para evaluación avanzada
+                const speechMs = speechStartTime ? Date.now() - speechStartTime : 0;
+                if (!speechStartTime) {
+                    speechStartTime = Date.now();
+                }
+
+                // Obtener datos de STT si están disponibles (desde openaiClient)
+                let sttData = null;
+                if (openaiClient && openaiClient.lastTranscript) {
+                    // Intentar obtener confianza del último transcript (si está disponible)
+                    sttData = {
+                        text: openaiClient.lastTranscript,
+                        confidence: openaiClient.lastTranscriptConfidence || 0.8, // Fallback a confianza media
+                        isNoise: false // TODO: Implementar detección de ruido
+                    };
+                }
+
+                // Evaluar si se debe interrumpir usando interruptPolicy
+                const shouldInterruptPlayback = shouldInterrupt(interruptPolicy, {
+                    speechMs: speechMs,
+                    confidence: sttData?.confidence,
+                    text: sttData?.text || '',
+                    isNoise: sttData?.isNoise || false
+                });
+
                 if (talkingTimer) clearTimeout(talkingTimer);
 
-                talkingTimer = setTimeout(() => {
-                    if (finished) return;
+                // ✅ Evaluación avanzada: Solo interrumpir si la política lo permite
+                if (shouldInterruptPlayback) {
+                    talkingTimer = setTimeout(() => {
+                        if (finished) return;
 
-                    log('info', `🗣️ [PLAYBACK] 🔥 BARGE-IN detected → User interrupted`);
-                    bargedIn = true;
+                        log('info', `🗣️ [PLAYBACK] 🔥 BARGE-IN detected (speechMs=${speechMs}, confidence=${sttData?.confidence || 'N/A'}) → User interrupted`);
+                        bargedIn = true;
 
-                    // Cancel OpenAI response if active
-                    if (openaiClient && openaiClient.activeResponseId) {
-                        openaiClient.cancelCurrentResponse('user_barge_in');
-                    }
+                        // Cancel OpenAI response if active
+                        if (openaiClient && openaiClient.activeResponseId) {
+                            openaiClient.cancelCurrentResponse('user_barge_in');
+                        }
 
-                    playback.stop().catch((err) =>
-                        log('warn', `⚠️ [PLAYBACK] Error stopping playback: ${err.message}`)
-                    );
-                }, this.talkingDebounceMs);
+                        playback.stop().catch((err) =>
+                            log('warn', `⚠️ [PLAYBACK] Error stopping playback: ${err.message}`)
+                        );
+                    }, this.talkingDebounceMs);
+                } else if (speechMs < interruptPolicy.minSpeechMs) {
+                    // Voz demasiado corta - esperar más
+                    log('debug', `🔒 [PLAYBACK] Voz detectada pero demasiado corta (${speechMs}ms < ${interruptPolicy.minSpeechMs}ms) - esperando más`);
+                }
             };
 
             const cleanup = () => {

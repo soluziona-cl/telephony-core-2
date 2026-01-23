@@ -1842,7 +1842,11 @@ async function finalizeCallStorage(ari, channel, ani, dnis, linkedId, conv, audi
     const finalFileName = `${linkedId}_${safeDni}_${ani}_${unixTime}`;
 
     const now = new Date();
-    const yyyymmdd = now.toISOString().split('T')[0].replace(/-/g, '');
+    // Usar zona horaria local (America/Santiago) en lugar de UTC
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const yyyymmdd = `${year}${month}${day}`;
     const finalDir = `/opt/telephony-core/recordings/${dnis}/${yyyymmdd}`;
 
     log("info", `📂 [FINALIZE] Preparando almacenamiento en ${finalDir}`);

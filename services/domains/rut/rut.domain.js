@@ -1,5 +1,24 @@
 import { RUT_PHASES } from './rut.phases.js';
 import { flowTrace } from '../../core/telemetry/flow-trace.js';
+import { log } from '../../../lib/logger.js';
+
+const TRACE_FILE = 'services/domains/rut/rut.domain.js';
+
+function traceReturn(fn, ctx, resp) {
+    log('debug', '🧭 [DOMAIN_TRACE]', {
+        file: TRACE_FILE,
+        fn,
+        event: ctx?.event,
+        phaseIn: ctx?.state?.rutPhase,
+        phaseOut: resp?.nextPhase,
+        action: resp?.action,
+        silent: resp?.silent,
+        skipInput: resp?.skipInput ?? resp?.skipUserInput,
+        audio: resp?.audio,
+        tts: resp?.ttsText ? 'YES' : 'NO'
+    });
+    return resp;
+}
 
 export async function runRutDomain(ctx) {
     const { transcript, state, event, webhookData } = ctx;
@@ -16,59 +35,102 @@ export async function runRutDomain(ctx) {
         result: 'RECV'
     });
 
+    log('info', '[DOMAIN][ENTER]', {
+        domain: 'quintero',
+        phase: state.rutPhase,
+        turn: ctx.turn || '?',
+        businessState: {
+            identificador: state.identificador,
+            rutDetectado: state.dni || null
+        }
+    });
+
     switch (state.rutPhase) {
         // ----------------------------------------------------------------
         // 1️⃣ INICIO: Reproducir Audio de Petición (Sin escucha)
         // ----------------------------------------------------------------
         case RUT_PHASES.INIT:
-            return {
+            return traceReturn('RUT_PHASES.INIT', ctx, {
                 audio: 'quintero/ask_rut',
                 ttsText: null,
                 nextPhase: RUT_PHASES.LISTEN_RUT,
                 action: 'PLAY_AUDIO',
                 silent: true,
                 allowBargeIn: false
-            };
+            });
 
         // ----------------------------------------------------------------
         // 2️⃣ ESCUCHA: Activar micrófono (Sin audio)
         // ----------------------------------------------------------------
         case RUT_PHASES.LISTEN_RUT:
-            // This phase ONLY listens. 
-            // It transitions to PROCESS_RUT to handle the result in the next turn.
-            return {
+            // This phase waits for input.
+            // If we have a transcript (from previous active listening turn), verify/process it.
+            // If NOT (e.g. first turn after silent audio), we enable listening and stay here.
+
+            if (transcript && transcript.trim().length > 0) {
+                // We heard something! Delegate to PROCESS logic
+                // (We can assume 'PROCESS_RUT' will handle the validation of this transcript)
+                return traceReturn('RUT_PHASES.LISTEN_RUT:hasTranscript', ctx, {
+                    ttsText: null,
+                    nextPhase: RUT_PHASES.PROCESS_RUT,
+                    silent: true, // Internal transition to process
+                    action: 'SET_STATE'
+                });
+            }
+
+            // No input yet (or just came from silent audio) -> Stay and Listen
+            // No input yet (or just came from silent audio) -> Stay and Listen
+            const listenResponse = {
                 ttsText: null,
-                nextPhase: RUT_PHASES.PROCESS_RUT,
-                silent: false, // 👂 LISTEN: Habilita STT y grabación
-                action: 'SET_STATE'
+                nextPhase: RUT_PHASES.LISTEN_RUT,
+                silent: false, // 👂 LISTEN: Enable STT for next turn
+                skipUserInput: false, // Explicitly allow input
+                action: 'USE_ENGINE', // Explicitly request engine usage (STT)
+                listen: true // Semantic flag
             };
+
+            log('info', '[DOMAIN][RESPONSE]', listenResponse);
+            return traceReturn('RUT_PHASES.LISTEN_RUT:listen', ctx, listenResponse);
 
         // ----------------------------------------------------------------
         // 3️⃣ PROCESAR: Evaluar transcript o NO_INPUT
         // ----------------------------------------------------------------
         case RUT_PHASES.PROCESS_RUT:
             // A) Evento NO_INPUT (Silencio)
+            // A) Evento NO_INPUT (Silencio)
             if (event === 'NO_INPUT' || !transcript || transcript.trim().length === 0) {
-                const noInputCount = (state.noInputCount || 0) + 1;
-                if (noInputCount >= 3) {
-                    return {
-                        ttsText: 'Lo siento, no he podido escucharte. Por favor intenta llamar nuevamente más tarde.',
-                        shouldHangup: true,
+                const silenceCount = (state.silenceCount || 0) + 1;
+                log('warn', '[DOMAIN][SILENCE]', {
+                    count: silenceCount,
+                    phase: state.rutPhase
+                });
+
+                if (silenceCount >= 3) {
+                    const hangupResponse = {
+                        ttsText: 'No logré escucharte, finalizaremos la llamada.',
+                        nextPhase: 'END',
+                        action: 'HANGUP',
+                        shouldHangup: true
                     };
+                    log('info', '[DOMAIN][RESPONSE] (Max Silence)', hangupResponse);
+                    return traceReturn('RUT_PHASES.PROCESS_RUT:maxSilence', ctx, hangupResponse);
                 }
+
                 // Retry Audio -> LISTEN_RUT
-                return {
+                const retryResponse = {
                     audio: 'quintero/ask_rut_retry',
                     nextPhase: RUT_PHASES.LISTEN_RUT,
                     action: 'PLAY_AUDIO',
                     silent: true,
                     allowBargeIn: false,
-                    statePatch: { noInputCount: noInputCount }
+                    statePatch: { silenceCount: silenceCount } // Persist silence count
                 };
+                log('info', '[DOMAIN][RESPONSE]', retryResponse);
+                return traceReturn('RUT_PHASES.PROCESS_RUT:retry', ctx, retryResponse);
             }
 
             // B) Input recibido -> Dispatch Webhook FORMAT_RUT
-            return {
+            return traceReturn('RUT_PHASES.PROCESS_RUT:formatWebhook', ctx, {
                 action: {
                     type: 'WEBHOOK',
                     action: 'FORMAT_RUT',
@@ -77,7 +139,7 @@ export async function runRutDomain(ctx) {
                 nextPhase: 'HANDLE_FORMAT_RUT', // Wait for webhook response
                 silent: true, // Internal processing
                 statePatch: { noInputCount: 0 } // Reset counter success
-            };
+            });
 
         // ----------------------------------------------------------------
         // 4️⃣ PROCESAR FORMATO (Respuesta Webhook)
@@ -88,7 +150,7 @@ export async function runRutDomain(ctx) {
 
                 if (data.ok && data.rut) {
                     // ✅ Formato correcto -> Validar Paciente
-                    return {
+                    return traceReturn('HANDLE_FORMAT_RUT:ok', ctx, {
                         action: {
                             type: 'WEBHOOK',
                             action: 'VALIDATE_PATIENT',
@@ -97,29 +159,29 @@ export async function runRutDomain(ctx) {
                         nextPhase: 'HANDLE_VALIDATE_PATIENT',
                         silent: true,
                         statePatch: { dni: data.rut }
-                    };
+                    });
                 } else {
                     // ❌ Formato inválido
                     const invalidCount = (state.invalidCount || 0) + 1;
                     if (invalidCount >= 3) {
-                        return {
+                        return traceReturn('HANDLE_FORMAT_RUT:invalidMax', ctx, {
                             ttsText: 'No he podido procesar tu RUT. Por favor intenta más tarde.',
                             shouldHangup: true
-                        };
+                        });
                     }
                     // Retry Audio -> LISTEN_RUT
-                    return {
+                    return traceReturn('HANDLE_FORMAT_RUT:invalidRetry', ctx, {
                         audio: 'quintero/ask_rut_retry',
                         nextPhase: RUT_PHASES.LISTEN_RUT,
                         action: 'PLAY_AUDIO',
                         silent: true,
                         allowBargeIn: false,
                         statePatch: { invalidCount: invalidCount }
-                    };
+                    });
                 }
             }
             // Fallback
-            return { nextPhase: RUT_PHASES.LISTEN_RUT, silent: false };
+            return traceReturn('HANDLE_FORMAT_RUT:fallback', ctx, { nextPhase: RUT_PHASES.LISTEN_RUT, silent: false });
 
         // ----------------------------------------------------------------
         // 5️⃣ PROCESAR PACIENTE (Respuesta Webhook)
@@ -135,7 +197,7 @@ export async function runRutDomain(ctx) {
                         edad: data.edad
                     };
 
-                    return {
+                    return traceReturn('HANDLE_VALIDATE_PATIENT:ok', ctx, {
                         // Dynamic Confirm TTS
                         ttsText: `Confirmo, ¿usted es ${data.nombre}?`,
                         nextPhase: RUT_PHASES.CONFIRM,
@@ -145,25 +207,26 @@ export async function runRutDomain(ctx) {
                         statePatch: {
                             rutPhase: RUT_PHASES.CONFIRM,
                             patient: patient,
-                            nombre_paciente: data.nombre
+                            nombre_paciente: data.nombre,
+                            identificador: data.rut // ✅ BusinessState: Identificador confirmado
                         }
-                    };
+                    });
                 } else {
                     // ❌ Paciente no encontrado
-                    return {
+                    return traceReturn('HANDLE_VALIDATE_PATIENT:notFound', ctx, {
                         ttsText: 'No encontramos registros con ese RUT.',
                         nextPhase: RUT_PHASES.ERROR,
                         shouldHangup: true
-                    };
+                    });
                 }
             }
-            return { nextPhase: 'HANDLE_VALIDATE_PATIENT', silent: true };
+            return traceReturn('HANDLE_VALIDATE_PATIENT:fallback', ctx, { nextPhase: 'HANDLE_VALIDATE_PATIENT', silent: true });
 
 
         case RUT_PHASES.CONFIRM:
             // Simple confirmation logic
             if (transcript && (transcript.toLowerCase().includes('si') || transcript.toLowerCase().includes('correcto'))) {
-                return {
+                return traceReturn('RUT_PHASES.CONFIRM:yes', ctx, {
                     ttsText: 'Gracias, continuamos con su atención',
                     nextPhase: RUT_PHASES.COMPLETE,
                     action: {
@@ -172,17 +235,17 @@ export async function runRutDomain(ctx) {
                             updates: { rutPhase: RUT_PHASES.COMPLETE }
                         }
                     }
-                };
+                });
             } else if (transcript) {
-                return {
+                return traceReturn('RUT_PHASES.CONFIRM:no', ctx, {
                     ttsText: 'Disculpe, no le entendí. ¿Es usted el paciente? Dígame sí o no.',
                     nextPhase: RUT_PHASES.CONFIRM,
                     silent: false
-                };
+                });
             }
             // If entered with empty/silent, listen
-            return { nextPhase: RUT_PHASES.CONFIRM, silent: false };
+            return traceReturn('RUT_PHASES.CONFIRM:listen', ctx, { nextPhase: RUT_PHASES.CONFIRM, silent: false });
     }
 
-    return { ttsText: null, nextPhase: state.rutPhase, silent: false };
+    return traceReturn('RUT_PHASES:default', ctx, { ttsText: null, nextPhase: state.rutPhase, silent: false });
 }

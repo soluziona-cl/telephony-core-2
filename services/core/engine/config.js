@@ -6,7 +6,15 @@ export const inboundConfig = {
     mode: "inbound",
 
     engine: {
-        traceFlow: true
+        traceFlow: true,
+        ENABLE_TURN_RECORDING: false, // ❌ DISABLED globally to prevent bridge locking
+        // 🎯 ENGINE_MODE: production (tolerante, fallback) | debug_strict (bloqueante, diagnóstico)
+        ENGINE_MODE: process.env.ENGINE_MODE || "production", // production | debug_strict
+        CONTRACT_WAIT_MS: process.env.ENGINE_MODE === "debug_strict" ? 8000 : 1500,
+        SNOOP_MAX_RETRIES: process.env.ENGINE_MODE === "debug_strict" ? 0 : 1,
+        STRICT_INVARIANTS: process.env.ENGINE_MODE === "debug_strict",
+        FAIL_FAST_ON_CONTRACT: process.env.ENGINE_MODE === "debug_strict",
+        ALLOW_DTMF_FALLBACK: process.env.ENGINE_MODE !== "debug_strict"
     },
 
     bargeIn: {

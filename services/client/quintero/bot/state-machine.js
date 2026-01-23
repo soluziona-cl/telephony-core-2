@@ -4,8 +4,9 @@
  */
 
 import { log } from '../../../../lib/logger.js';
-import waitBody from './handlers/wait-body.js';
-import waitDV from './handlers/wait-dv.js';
+import WAIT_RUT from '../phases/WAIT_RUT.js';
+// import waitBody from './handlers/wait-body.js'; // 🗑️ Legacy
+// import waitDV from './handlers/wait-dv.js'; // 🗑️ Legacy
 import confirm from './handlers/confirm.js';
 import askSpecialty from './handlers/ask-specialty.js';
 import parseSpecialty from './handlers/parse-specialty.js';
@@ -49,7 +50,8 @@ export function initialState() {
     confirmed: false,
     lastTtsPhase: null, // 🛡️ Anti-replay: Última fase hablada
     lastTtsText: null,   // 🛡️ Anti-replay: Último texto hablado
-    greetingPlayed: false // 🛡️ State: Flag para controlar saludo inicial único
+    greetingPlayed: false, // 🛡️ State: Flag para controlar saludo inicial único
+    identificador: 'PENDING' // ✅ BusinessState: Identificador de sesión para SQL
   };
 }
 
@@ -71,13 +73,45 @@ export async function runState(ctx, state) {
       result = await startGreeting(ctx, state);
       break;
 
-    case 'WAIT_BODY':
+    // 🆔 FASE UNIFICADA DE RUT (Reemplaza WAIT_BODY / WAIT_DV)
     case 'WAIT_RUT':
-      result = waitBody(ctx, state);
-      break;
+    case 'WAIT_BODY': // Backwards compatibility redirect
+    case 'WAIT_DV':   // Backwards compatibility redirect
+      result = await WAIT_RUT(ctx, state);
 
-    case 'WAIT_DV':
-      result = waitDV(ctx, state);
+      // 🪝 Manejo de respuesta del Webhook FORMAT_RUT
+      if (ctx.event === 'WEBHOOK_RESPONSE' && ctx.webhookData?.action === 'FORMAT_RUT') {
+        const { data } = ctx.webhookData;
+
+        if (!data || !data.ok) {
+          // RUT inválido o error en webhook -> Repetir
+          result = {
+            nextPhase: 'WAIT_RUT',
+            ttsText: 'No pude reconocer el RUT. Por favor repítalo completo.',
+            silent: false,
+            skipUserInput: false,
+            action: { type: 'SET_STATE' }
+          };
+        } else {
+          // RUT válido -> Guardar y avanzar
+          const { rut } = data;
+          state.rutFormatted = rut; // Guardar en state
+
+          log('info', '✅ [STATE MACHINE] RUT reconocido y formateado', { rut });
+
+          result = {
+            nextPhase: 'VALIDATE_PATIENT', // Siguiente fase lógica
+            ttsText: null,
+            silent: false,
+            skipUserInput: true,
+            action: {
+              type: 'WEBHOOK',
+              action: 'VALIDATE_PATIENT',
+              rut
+            }
+          };
+        }
+      }
       break;
 
     case 'CONFIRM':

@@ -4,6 +4,7 @@ import path from "path";
 import { sql, poolPromise } from "../../../../lib/db.js";
 import { inboundConfig as config } from "../config.js";
 import { log } from "../../../../lib/logger.js";
+import redis from "../../../../lib/redis.js";
 
 /**
  * Service responsible for finalizing the call, saving logs, managing recordings,
@@ -21,6 +22,13 @@ export class CallFinalizer {
      */
     static async finalize(ari, channel, session, audioState, businessState) {
         try {
+            // 🛠️ FIX 5: HARNESS CALL FINALIZER (Anti-Crash)
+            if (!session || !session.linkedId) {
+                log("warn", "⚠️ [FINALIZE] Finalize skipped: incomplete session context (no linkedId)");
+                return;
+            }
+            if (!businessState) businessState = {};
+
             const startTime = session.startTime || new Date();
             const endTime = new Date();
             const duration = Math.round((endTime - startTime) / 1000);
@@ -32,16 +40,48 @@ export class CallFinalizer {
 
             // 2. Prepare Paths and Metadata
             const unixTime = Math.floor(startTime.getTime() / 1000);
-            // Defensive check for DNI/ANI
-            const safeDni = businessState.dni ? businessState.dni.replace(/[^0-9Kk]/g, '') : 'UNKNOWN';
+            
+            // 🎯 Captura de DNI para SQL (no se usa en nombre de archivo)
+            // Se mantiene para persistencia en base de datos
+            let dniValue = businessState.dni;
+            if (!dniValue && session.linkedId) {
+                try {
+                    // Intentar leer identificador consolidado de Redis (puede contener RUT)
+                    const redisIdentifier = await redis.get(`session:identifier:${session.linkedId}`);
+                    if (redisIdentifier && /^[0-9]+[Kk]?$/.test(redisIdentifier.replace(/[.-]/g, ''))) {
+                        dniValue = redisIdentifier;
+                        log("info", `🎯 [FINALIZE] DNI recuperado de Redis: ${dniValue}`);
+                    }
+                } catch (err) {
+                    log("warn", `⚠️ [FINALIZE] Error leyendo identificador de Redis para DNI: ${err.message}`);
+                }
+            }
+            
+            // Defensive check for ANI/DNIS
+            // 📌 NOTA: Se usa ANI en lugar de RUT en el nombre del archivo porque:
+            // - El ANI siempre está disponible (número del llamante)
+            // - No todos los bots capturan RUT
+            // - El ANI es más confiable para identificar la grabación
             const safeAni = session.ani || 'UNKNOWN';
             const safeDnis = session.dnis || 'UNKNOWN';
 
-            const finalFileName = `${session.linkedId}_${safeDni}_${safeAni}_${unixTime}`;
+            // Formato: {linkedId}_{ANI}_{unixTime}.wav
+            // Eliminado DNI del nombre de archivo ya que no todos los bots lo capturan
+            const finalFileName = `${session.linkedId}_${safeAni}_${unixTime}`;
 
             const now = new Date();
-            const yyyymmdd = now.toISOString().split('T')[0].replace(/-/g, '');
-            const finalDir = `/opt/telephony-core/recordings/${safeDnis}/${yyyymmdd}`;
+            // Usar zona horaria local (America/Santiago) en lugar de UTC
+            const year = now.getFullYear();
+            const month = String(now.getMonth() + 1).padStart(2, '0');
+            const day = String(now.getDate()).padStart(2, '0');
+            const yyyymmdd = `${year}${month}${day}`;
+
+            // ✅ CANONICAL PATH: /recordings/{domain}/{dnis}/{yyyymmdd}/
+            // Cambiado de {linkedId} a {yyyymmdd} para agrupar grabaciones por fecha
+            // This ensures NO COLLISION and easy debugging.
+            const domain = session.domain || 'default';
+
+            const finalDir = `/opt/telephony-core/recordings/${domain}/${safeDnis}/${yyyymmdd}`;
 
             log("info", `📂 [FINALIZE] Preparando almacenamiento en ${finalDir}`);
 
@@ -107,34 +147,65 @@ export class CallFinalizer {
      */
     static async persistToSql(session, startTime, endTime, ani, dnis, finalFileName, transcriptText, businessState, audioState) {
         try {
+            // 🎯 MEJORA 5: Protección SQL defensiva - transcripción puede ser vacía
+            const safeTranscript = transcriptText || '';
+            
+            // 🎯 INCREMENTAL RUT: Leer identificador consolidado de Redis si existe
+            // Esto permite usar el RUT consolidado incluso si businessState no lo tiene
+            let identificador = businessState.identificador;
+            if (!identificador && session.linkedId) {
+                try {
+                    const redisIdentifier = await redis.get(`session:identifier:${session.linkedId}`);
+                    if (redisIdentifier) {
+                        identificador = redisIdentifier;
+                        log("info", `🎯 [FINALIZE] Identificador leído de Redis: ${identificador}`);
+                    }
+                } catch (err) {
+                    log("warn", `⚠️ [FINALIZE] Error leyendo identificador de Redis: ${err.message}`);
+                }
+            }
+
             // 🛡️ GUARD: Identificador is mandatory for sp_GuardarGestionLlamada
-            const identificador = businessState.identificador || session.sessionId; // Fallback to sessionId/linkedId if acceptable, otherwise strict check? 
+            // Fallback to sessionId/linkedId if acceptable, otherwise strict check? 
             // User requested: "Ensured essential context variables like ctx.identificador... are initialized".
             // If it's still missing, we skip to avoid crash.
 
             if (!identificador) {
-                log("warn", "⚠️ [FINALIZE] Falta @Identificador (businessState.identificador). Omitiendo guardado SQL para evitar error.");
-                return;
+                log("warn", "⚠️ [FINALIZE] Falta @Identificador. Usando sessionId como fallback.");
             }
+            const finalId = identificador || session.sessionId || session.linkedId;
 
-            log("info", `🗄️ [FINALIZE] Registrando gestión en SQL Server (Identificador=${identificador})...`);
+            log("info", `🗄️ [FINALIZE] Registrando gestión en SQL Server (Identificador=${finalId})...`);
             const pool = await poolPromise;
             if (pool) {
+                // 🎯 FALLA D FIX: Agregar @DNI_Capturado (requerido por SP)
+                // Usar el identificador capturado (RUT) o NULL si no hay
+                const dniCapturado = finalId && finalId !== session.sessionId && finalId !== session.linkedId 
+                    ? finalId 
+                    : null;
+                
+                // Calcular duración en segundos
+                const duracionSegundos = startTime && endTime 
+                    ? Math.max(0, Math.floor((endTime.getTime() - startTime.getTime()) / 1000))
+                    : 0;
+                
                 await pool.request()
                     .input('FechaHoraInicio', sql.DateTime, startTime)
                     .input('FechaHoraTermino', sql.DateTime, endTime)
+                    .input('DuracionSegundos', sql.Int, duracionSegundos) // 🎯 FIX: Parámetro requerido por SP
                     .input('Agente', sql.NVarChar, 'VoiceBot')
                     .input('ANI', sql.NVarChar, ani)
                     .input('DNIS', sql.NVarChar, dnis)
-                    .input('RUT_Cliente', sql.NVarChar, businessState.dni || 'UNKNOWN') // Use DNI if validated, else UNKNOWN
-                    .input('Identificador', sql.NVarChar, identificador) // ✅ ADDED
-                    .input('Nombre_Archivo_Grabacion', sql.NVarChar, `${finalFileName}.wav`)
-                    .input('Estado_Llamada', sql.NVarChar, session.terminated ? 'Terminated' : 'Completed')
-                    .input('Transcription_Log', sql.NVarChar, transcriptText)
-                    .input('Resumen_Gestion', sql.NVarChar, businessState.summary || 'Sin resumen')
-                    .input('Motivo_Termino', sql.NVarChar, 'Normal') // Could be enhanced with termination reason
-                    .input('Id_Llamada_Asterisk', sql.NVarChar, session.linkedId)
-                    .execute('sp_GuardarGestionLlamada'); // Using the transversal SP name
+                    // 🎯 FIX: @RUT_Cliente no es un parámetro del SP - eliminado
+                    .input('Identificador', sql.NVarChar, finalId)
+                    .input('DNI_Capturado', sql.NVarChar, dniCapturado) // 🎯 FALLA D FIX: Parámetro requerido (contiene el RUT capturado)
+                    .input('RutaGrabacion', sql.NVarChar, `${finalFileName}.wav`) // 🎯 FIX: Nombre correcto del parámetro
+                    // 🎯 FIX: @Estado_Llamada no es un parámetro del SP - eliminado
+                    .input('Transcripcion', sql.NVarChar, safeTranscript || '') // 🎯 MEJORA 5: Protección SQL defensiva (nombre correcto del parámetro)
+                    //.input('Resumen_Gestion', sql.NVarChar, businessState.summary || 'Sin resumen') // REMOVED: Likely causing 'too many arguments'
+                    //.input('Motivo_Termino', sql.NVarChar, 'Normal') // REMOVED
+                    //.input('Id_Llamada_Asterisk', sql.NVarChar, session.linkedId) // REMOVED
+                    .execute('sp_GuardarGestionLlamada');
 
                 log("info", `✅ [FINALIZE] Gestión registrada exitosamente en SQL.`);
             } else {

@@ -18,8 +18,18 @@ export const PHASES = {
     'INFORM_AVAILABILITY': { requiresInput: false },
     'FINALIZE': { requiresInput: false },
     'COMPLETE': { requiresInput: false },
-    'GOODBYE': { requiresInput: false },      // Nueva fase explícita
-    'NONE': { requiresInput: true }           // Fase inicial / abierta
+    'GOODBYE': { requiresInput: false, kind: 'SPEAK' },      // Nueva fase explícita
+    'NONE': { requiresInput: true, kind: 'LISTEN' },          // Fase inicial / abierta
+
+    // 🧠 RUT FLOW (STRICT MODE COMPLIANT)
+    'START_GREETING': { requiresInput: false, kind: 'SPEAK' },
+    'ASK_RUT': { requiresInput: false, kind: 'SPEAK' },
+    'ASK_RUT_RETRY': { requiresInput: false, kind: 'SPEAK' },
+    'LISTEN_RUT': { requiresInput: true, kind: 'LISTEN' },
+    'PROCESS_RUT': { requiresInput: false, kind: 'VALIDATE' },
+    'HANDLE_FORMAT_RUT': { requiresInput: false, kind: 'VALIDATE' },
+    'HANDLE_VALIDATE_PATIENT': { requiresInput: false, kind: 'VALIDATE' },
+    'WAIT_RUT_INPUT': { requiresInput: true, kind: 'LISTEN' } // Legacy support
 };
 
 /**

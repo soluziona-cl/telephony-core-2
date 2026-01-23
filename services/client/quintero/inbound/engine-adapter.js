@@ -3,6 +3,7 @@ import { normalizeDomainResponse, assertDomainResponse } from '../domainResponse
 import quinteroBot from '../bot/index.js';
 import webhookClient from '../n8n/webhook-client.js';
 import { log } from '../../../../lib/logger.js';
+import { domainTrace } from '../bot/utils/domainTrace.js';
 
 /**
  * 🌉 Quintero Capsule Adapter
@@ -11,7 +12,7 @@ import { log } from '../../../../lib/logger.js';
  */
 
 // ✅ LOAD SYSTEM PROMPT
-const systemPrompt = fs.readFileSync('/opt/telephony-core/services/client/quintero/openai/prompts/quintero-confirmacion.txt', 'utf-8');
+const systemPrompt = fs.readFileSync('/opt/telephony-core/services/client/quintero/openai/prompts/rut-strict.txt', 'utf-8');
 
 // ✅ GUARDRAIL: Validar estrictamente string prompt
 function safePrompt(prompt) {
@@ -25,6 +26,10 @@ async function quinteroAdapter(ctx) {
     log("info", "🌉 [CAPSULE] Entering Quintero Adapter");
 
     try {
+        if (!ctx.linkedId) {
+            ctx.linkedId = ctx.channel?.linkedid || ctx.channel?.id || ctx.channelId || ctx.sessionId;
+        }
+
         // Delegate to internal bot logic
         let result = await quinteroBot(ctx);
 
@@ -99,19 +104,123 @@ async function quinteroAdapter(ctx) {
             result.action = 'SAY_TEXT';
         }
 
+        // 🔁 Compat: capsule usa skipInput, contrato usa skipUserInput
+        if (typeof result.skipInput === 'boolean' && typeof result.skipUserInput !== 'boolean') {
+            result.skipUserInput = result.skipInput;
+        }
+
+        const before = { ...result };
         const normalized = normalizeDomainResponse(result, ctx.state?.rutPhase);
+        
+        // Preserve config if provided
+        if (result?.config && typeof result.config === 'object') {
+            normalized.config = result.config;
+        }
+
+        // 🔒 Gobernanza: adapter NO decide negocio; solo asegura consistencia minima
+        const normalizedAction = normalized.action?.type ?? normalized.action;
+        const isSetState = normalizedAction === 'SET_STATE' || !normalizedAction;
+
+        // 🔐 Regla FSM: nextPhase NO es fase activa si no hay SET_STATE
+        const intendedNextPhase = normalized.nextPhase;
+        if (!isSetState) {
+            const activePhase = result?.phase || ctx.state?.rutPhase;
+            if (activePhase) {
+                normalized.nextPhase = activePhase;
+            }
+        }
+
+        if (normalized.nextPhase === 'LISTEN_RUT' && isSetState) {
+            normalized.silent = false;
+            normalized.skipInput = false;
+        }
+
+        // 🔇 Gobernanza: PLAY_AUDIO nunca debe abrir escucha
+        if (!isSetState) {
+            normalized.skipInput = true;
+        }
+
+        domainTrace(log, {
+            file: "services/client/quintero/inbound/engine-adapter.js",
+            fn: "normalizeDomainResponse",
+            event: ctx?.eventType || ctx?.event || "UNKNOWN",
+            phaseIn: before?.nextPhase || ctx.state?.rutPhase,
+            phaseOut: normalized?.nextPhase,
+            action: normalized?.action,
+            silent: normalized?.silent,
+            skipInput: normalized?.skipInput,
+            audio: normalized?.audio,
+            tts: normalized?.ttsText,
+            nextPhase: intendedNextPhase,
+            enableIncremental: normalized?.enableIncremental, // 🎯 CONTRATO: Trazar flags incrementales
+            disableIncremental: normalized?.disableIncremental, // 🎯 CONTRATO: Trazar flags incrementales
+            diff: {
+                silentChanged: before?.silent !== normalized?.silent,
+                skipInputChanged: before?.skipInput !== normalized?.skipInput,
+                phaseChanged: before?.nextPhase !== normalized?.nextPhase,
+                phaseOverridden: intendedNextPhase !== normalized?.nextPhase
+            }
+        });
+
+        // 🚨 Validacion fatal: LISTEN_RUT requiere silent:false cuando se abre escucha real
+        if (normalized.nextPhase === 'LISTEN_RUT' && isSetState && normalized.silent !== false) {
+            domainTrace(log, {
+                file: "services/client/quintero/inbound/engine-adapter.js",
+                fn: "normalizeDomainResponse:critical",
+                event: ctx?.eventType || ctx?.event || "UNKNOWN",
+                phaseIn: before?.nextPhase || ctx.state?.rutPhase,
+                phaseOut: "LISTEN_RUT",
+                action: normalized?.action,
+                silent: normalized?.silent,
+                skipInput: normalized?.skipInput,
+                audio: normalized?.audio,
+                tts: normalized?.ttsText,
+                nextPhase: normalized?.nextPhase,
+                level: "CRITICAL",
+                reason: "LISTEN_RUT_SILENT_INVALID"
+            });
+            log("error", "🚨 [CRITICAL] LISTEN_RUT returned silent != false. Applying safe fallback.");
+            return normalizeDomainResponse({
+                nextPhase: 'LISTEN_RUT',
+                audio: 'quintero/ask_rut',
+                silent: false,
+                skipInput: true,
+                allowBargeIn: false,
+                action: 'PLAY_AUDIO',
+                state: result.state || ctx.state
+            }, ctx.state?.rutPhase);
+        }
         const errs = assertDomainResponse(normalized);
 
         if (errs.length > 0) {
             log("warn", `⚠️ [CAPSULE][CONTRACT] Invalid response from bot: ${JSON.stringify(errs)}`, { result });
             // Fail-Closed Fallback: Ask user to repeat or hold, do not crash.
             return normalizeDomainResponse({
-                nextPhase: ctx.state?.rutPhase || 'WAIT_BODY',
+                nextPhase: ctx.state?.rutPhase || 'LISTEN_RUT', // Force valid phase
                 ttsText: 'Disculpe, hubo un error técnico. ¿Podría repetir?',
                 silent: false,
                 skipUserInput: false,
                 action: { type: 'SET_STATE' },
                 state: ctx.state // Preserve state
+            });
+        }
+
+        // 🛡️ STRICT PHASE ENFORCEMENT
+        if (!normalized.nextPhase) {
+            log("error", "⛔ [ADAPTER] CRITICAL: Capsule returned undefined phase. Forcing LISTEN_RUT.");
+            normalized.nextPhase = 'LISTEN_RUT';
+            domainTrace(log, {
+                file: "services/client/quintero/inbound/engine-adapter.js",
+                fn: "forcePhase",
+                event: ctx?.eventType || ctx?.event || "UNKNOWN",
+                phaseIn: ctx.state?.rutPhase,
+                phaseOut: normalized.nextPhase,
+                action: normalized.action,
+                silent: normalized.silent,
+                skipInput: normalized.skipInput,
+                audio: normalized.audio,
+                tts: normalized.ttsText,
+                nextPhase: normalized.nextPhase
             });
         }
 
@@ -124,7 +233,11 @@ async function quinteroAdapter(ctx) {
         // Ensure state is returned for engine persistence
         return {
             ...normalized,
-            state: result.state || ctx.state
+            config: normalized.config || result?.config, // Preserve config for listenTimeout
+            state: result.state || ctx.state,
+            // 🎯 CONTRATO INCREMENTAL: Preservar flags del dominio
+            enableIncremental: result.enableIncremental,
+            disableIncremental: result.disableIncremental
         };
 
     } catch (error) {
@@ -135,5 +248,11 @@ async function quinteroAdapter(ctx) {
 
 // Attach system prompt to the adapter function
 quinteroAdapter.systemPrompt = systemPrompt;
+
+// ✅ CONFIG: Realtime STT (Fix for NO_INPUT issue)
+quinteroAdapter.sttMode = 'realtime';
+
+// ✅ IDENTITY
+quinteroAdapter.domainName = 'quintero';
 
 export default quinteroAdapter;

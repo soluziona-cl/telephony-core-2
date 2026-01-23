@@ -9,6 +9,8 @@ import { startVoiceBotSessionV3 } from "../engine/voice-engine.js";
 import { resolveClientCapsule } from "../../router/client-entry-router.js";
 import { inboundConfig } from "../engine/config.js";
 import { startRecording, stopRecording } from "../telephony/telephony-recorder.js";
+import { isTeardownAllowed, isActionAllowed } from "../engine/lifecycle-contract.js";
+import { validateAndNormalizeCapsule } from "../engine/capsule-contract.js";
 dotenv.config();
 
 
@@ -18,6 +20,7 @@ dotenv.config();
 // ⚙️ Configuración base
 // ------------------------------------------------------
 const APP = process.env.ARI_APP || "crm_app";
+const SNOOP_APP = "media-snoop";
 
 // === Guardas y helpers globales ===
 const ORIGINATE_TIMEOUT_SEC = parseInt(process.env.ORIGINATE_TIMEOUT_SEC || "45", 10);
@@ -25,11 +28,15 @@ const RING_GUARD_MS = parseInt(process.env.RING_GUARD_MS || "2000", 10); // guar
 const pendingGuards = new Map(); // linkedId -> timer
 
 async function publishHangupOnce(channel, payload) {
-  const id = payload.channelId || channel?.id;
+  const id = channel?.id;
   if (!id) return;
   const key = `hangup:${id}`;
   if (await redis.exists(key)) return;
   await redis.setEx(key, 15, "1"); // 15s anti-duplicado
+
+  // Limpiar flag de snoop al colgar
+  await redis.del(`snoop:created:${id}`);
+
   await publish(channel, "call.hangup", payload);
 }
 
@@ -130,12 +137,61 @@ async function ensureBridge(ari, bridgeId) {
 // Compatible con llamadas internas (crm_app) y externas.
 // ==========================================================
 function parseArgs(event, args) {
-
   // ARI recibe SOLO los parámetros después del app:
   // Stasis(crm_app, voicebot, 1003, 3000)
   // event.args = ["voicebot", "1003", "3000"]
 
-  let raw = Array.isArray(args) && args.length ? args : (event.args || []);
+  log("debug", "🔍 parseArgs Input", {
+    argsType: typeof args,
+    argsIsArray: Array.isArray(args),
+    argsLen: Array.isArray(args) ? args.length : 'N/A',
+    eventArgsRaw: event.eventArgsRaw || 'undefined'
+  });
+
+  // 1. Try standard args (prioridad: args parameter > event.args > eventArgsRaw)
+  let raw = null;
+
+  // Prioridad 1: args parameter (si viene como parámetro)
+  if (Array.isArray(args) && args.length > 0) {
+    raw = args;
+    log("debug", "✅ [parseArgs] Usando args parameter", { raw });
+  }
+  // Prioridad 2: event.args (si existe y es array)
+  else if (Array.isArray(event.args) && event.args.length > 0) {
+    raw = event.args;
+    log("debug", "✅ [parseArgs] Usando event.args", { raw });
+  }
+  // Prioridad 3: eventArgsRaw (JSON string)
+  else if (event.eventArgsRaw) {
+    try {
+      const parsed = JSON.parse(event.eventArgsRaw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        raw = parsed;
+        log("info", "✅ [parseArgs] Usando eventArgsRaw (JSON parseado)", { raw });
+      }
+    } catch (e) {
+      log("warn", "⚠️ [parseArgs] Failed to parse eventArgsRaw", { raw: event.eventArgsRaw, error: e.message });
+    }
+  }
+
+  // Si aún no tenemos raw, usar array vacío (será "unknown" más abajo)
+  if (!raw || !Array.isArray(raw)) {
+    raw = [];
+  }
+
+  // 2. Fallback: Parse eventArgsRaw (common in some Node/ARI versions)
+  if ((!raw || raw.length === 0) && event.eventArgsRaw) {
+    try {
+      // It might be a JSON string like '["voicebot_quintero_query","966247067","9001"]'
+      const parsed = JSON.parse(event.eventArgsRaw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        raw = parsed;
+        log("info", "✅ [ARI] Parsed args from eventArgsRaw", { raw });
+      }
+    } catch (e) {
+      log("warn", "⚠️ [ARI] Failed to parse eventArgsRaw", { raw: event.eventArgsRaw });
+    }
+  }
 
   // Normalizar casos string
   if (typeof raw === "string") raw = [raw];
@@ -149,6 +205,9 @@ function parseArgs(event, args) {
 
   // ⚠️ Forzar formato mínimo
   if (!Array.isArray(raw)) raw = [];
+
+  // Guardrail: If raw is still empty, we have a problem.
+  // We will let "unknown" flow but the Engine will block it.
   if (raw.length < 1) raw = ["unknown"];
 
   // 🔥 Mapeo real:
@@ -157,6 +216,8 @@ function parseArgs(event, args) {
   // raw[2] = DNIS
 
   const mode = raw[0] || "unknown";
+
+  // LOGIC CHANGE: Prefer ARGS over Channel Vars for consistency with Dialplan
   const source = raw[1] || event.channel?.caller?.number || "UNKNOWN"; // ANI
   const target = raw[2] || event.channel?.dialplan?.exten || "UNKNOWN"; // DNIS
 
@@ -277,8 +338,10 @@ async function findAndHangupRelatedChannels(ari, linkedId, culpritId, reason = "
         );
 
         for (const ch of linkedChans) {
-          log("info", `🎯 Nivel 3: Canal encontrado por linkedId: ${ch.id}`);
-          relatedChannels.push({ id: ch.id, source: "linkedid" });
+          // 🎯 Detectar si es un Snoop channel
+          const isSnoop = ch.name && ch.name.startsWith('Snoop/');
+          log("info", `🎯 Nivel 3: Canal encontrado por linkedId: ${ch.id} ${isSnoop ? '(Snoop)' : ''}`);
+          relatedChannels.push({ id: ch.id, source: isSnoop ? "snoop" : "linkedid" });
         }
       } catch (err) {
         log("error", "Error listando canales en Nivel 3", err.message);
@@ -286,7 +349,89 @@ async function findAndHangupRelatedChannels(ari, linkedId, culpritId, reason = "
     }
 
     // 🔨 EJECUTAR HANGUP DE TODOS LOS CANALES ENCONTRADOS
+    // 🎯 LIFECYCLE GOVERNANCE: Usar el contrato de lifecycle para determinar si se puede destruir Snoop
+    const currentPhase = await redis.get(`phase:${linkedId}`);
+
+    log("info", `🔒 [LIFECYCLE] Verificando cleanup de canales relacionados:`, {
+      linkedId: linkedId,
+      currentPhase: currentPhase || 'NULL',
+      relatedChannelsCount: relatedChannels.length,
+      relatedChannels: relatedChannels.map(ch => ({ id: ch.id, source: ch.source })),
+      reason: reason
+    });
+
+    // ✅ FIX: Permitir cleanup durante hangup/stasisend independientemente de la fase
+    // Durante hangup, la sesión está terminando, así que el cleanup debe permitirse
+    const isCleanupReason = reason === 'hangup-request' || reason === 'cleanup' || reason === 'stasis-end' || reason === 'cancelled-by-origin';
+
+    const canDestroySnoop = currentPhase ? await isActionAllowed(currentPhase, 'DESTROY_SNOOP', {
+      linkedId: linkedId,
+      reason: reason,
+      relatedChannelsCount: relatedChannels.length
+    }) : false;
+    const canTeardown = currentPhase ? isTeardownAllowed(currentPhase, {
+      linkedId: linkedId,
+      reason: reason
+    }) : false;
+    const protectedSnoopId = await redis.get(`snoop:active:${linkedId}`); // 🎯 Verificar Snoop protegido
+
+    // ✅ FIX: Durante cleanup/hangup, permitir destrucción aunque la fase no lo permita normalmente
+    const effectiveCanDestroySnoop = isCleanupReason ? true : canDestroySnoop;
+    const effectiveCanTeardown = isCleanupReason ? true : canTeardown;
+
+    log("info", `🔒 [LIFECYCLE] Estado de permisos para cleanup:`, {
+      phase: currentPhase || 'NULL',
+      canDestroySnoop: canDestroySnoop,
+      canTeardown: canTeardown,
+      effectiveCanDestroySnoop,
+      effectiveCanTeardown,
+      isCleanupReason,
+      protectedSnoopId: protectedSnoopId || 'none',
+      reason: reason
+    });
+
     for (const { id: chId, source } of relatedChannels) {
+      // 🛡️ PROTECCIÓN: No destruir Snoop si el lifecycle no lo permite (excepto durante cleanup)
+      // Verificar tanto por source como por ID del Snoop protegido
+      const isSnoop = source === 'snoop' || chId.startsWith('Snoop/') || chId === protectedSnoopId;
+
+      log("debug", `🔒 [LIFECYCLE] Evaluando canal para cleanup:`, {
+        channelId: chId,
+        source: source,
+        isSnoop: isSnoop,
+        phase: currentPhase,
+        canDestroySnoop: canDestroySnoop,
+        effectiveCanDestroySnoop,
+        canTeardown: canTeardown,
+        effectiveCanTeardown,
+        isCleanupReason,
+        protectedSnoopId: protectedSnoopId
+      });
+
+      // ✅ FIX: Solo bloquear si NO es cleanup y el contrato no permite
+      if (isSnoop && !effectiveCanDestroySnoop && !effectiveCanTeardown && !isCleanupReason) {
+        log("info", `🔒 [LIFECYCLE] ❌ NO destruir Snoop ${chId}:`, {
+          channelId: chId,
+          phase: currentPhase,
+          teardownAllowed: canTeardown,
+          allowsDESTROY_SNOOP: canDestroySnoop,
+          reason: reason,
+          protectedSnoopId: protectedSnoopId
+        });
+        continue; // ✅ Saltar este canal, no destruirlo
+      }
+
+      // ✅ FIX: Durante cleanup, permitir destrucción incluso en fases LISTEN_*
+      // La protección legacy solo aplica durante operación normal, no durante hangup
+      if (!isCleanupReason) {
+        const listenPhases = ['LISTEN_RUT', 'LISTEN_OPTION', 'LISTEN_CONFIRMATION'];
+        const isListenPhase = currentPhase && listenPhases.includes(currentPhase);
+        if (isListenPhase && isSnoop) {
+          log("info", `🔒 [SNOOP PROTECTION] No destruir Snoop ${chId} (fase ${currentPhase}, reason=${reason})`);
+          continue; // ✅ Saltar este canal, no destruirlo
+        }
+      }
+
       log("info", `🧩 Forzando hangup de canal ${chId} (${reason}) [fuente: ${source}]`);
 
       hangupPromises.push(
@@ -340,7 +485,9 @@ async function findAndHangupRelatedChannels(ari, linkedId, culpritId, reason = "
 // ------------------------------------------------------
 async function hangupOriginAndCleanup(ari, linkedId, culpritChannelId) {
   const lockKey = `cleanup:${linkedId}`;
-  let lockValue = null;
+
+  // [FIX] Risk 1: Acquire lock properly
+  const lockValue = await acquireLock(lockKey, 10);
 
   try {
     if (!lockValue) {
@@ -430,6 +577,28 @@ AriClient.connect(
     // 🎬 STASIS START
     // ------------------------------------------------------
     ari.on("StasisStart", async (event, channel, args) => {
+      // 🛡️ Guard: Ignore snoop app events in main handler
+      if (event.application === SNOOP_APP) return;
+
+      // ✅ FIX B: No rutees StasisStart de ExternalMedia al VoiceBot
+      // ExternalMedia channels tienen ID que empieza con "stt-" o appArgs con role=externalMedia
+      const eventArgsStr = Array.isArray(event.args) ? event.args.join(',') : (event.args || '');
+      const isExternalMedia =
+        (channel.id && channel.id.startsWith('stt-')) ||
+        (channel.name && channel.name.startsWith('stt-')) ||
+        (eventArgsStr.includes('role=externalMedia') || eventArgsStr.includes('kind=stt')) ||
+        (!event.args || (Array.isArray(event.args) && event.args.length === 0) || event.args === '[]');
+
+      if (isExternalMedia) {
+        log("info", `🔇 [ARI] ExternalMedia channel detected (${channel.id}) - ignored (no routing to VoiceBot)`, {
+          channelId: channel.id,
+          channelName: channel.name,
+          appArgs: event.args,
+          appArgsStr: eventArgsStr,
+          linkedId: channel.linkedid
+        });
+        return; // No procesar ExternalMedia como sesión VoiceBot
+      }
 
       log("error", "📦 DEBUG RAW ARGS", {
         args,
@@ -446,6 +615,49 @@ AriClient.connect(
       const ani = parsed.source;
       const dnis = parsed.target;
       const linkedId = channel.linkedid || channel.id;
+      let snoopChannel = null;
+
+      // 🎯 FIX CRÍTICO: El canal principal (PJSIP/SIP) DEBE continuar para iniciar VoiceBot
+      // Los canales STT/UnicastRTP son manejados por el engine, pero NO bloquean el flujo principal
+      // NO retornar aquí - permitir que todos los canales continúen (el engine decidirá qué hacer)
+
+      // 🕵️‍♂️ SNOOP RX-ONLY (usuario → STT)
+      // 🎯 CAMBIO CRÍTICO: NO crear Snoop aquí durante StasisStart
+      // El Snoop debe crearse justo antes de LISTEN_RUT en el engine
+      // Solo verificar si ya existe uno previo (para compatibilidad)
+      try {
+        const snoopKey = `snoop:created:${channel.id}`;
+        const existingSnoopId = await redis.get(snoopKey);
+
+        if (existingSnoopId) {
+          log('info', '🕵️‍♂️ [SNOOP] Snoop ya activo (recuperado de Redis)', {
+            channelId: channel.id,
+            snoopId: existingSnoopId
+          });
+          snoopChannel = { id: existingSnoopId };
+
+          // 🎯 Marcar como protegido si ya existe
+          await redis.set(
+            `snoop:active:${linkedId}`,
+            existingSnoopId,
+            { EX: 600 }
+          );
+        } else {
+          // 🎯 NO crear Snoop aquí - se creará en el engine justo antes de LISTEN_RUT
+          // Esto asegura que el Snoop pertenezca al lifecycle de LISTEN_RUT, no a StasisStart
+          log('info', '🕵️‍♂️ [SNOOP] Snoop se creará en el engine cuando entre a LISTEN_RUT', {
+            channelId: channel.id,
+            linkedId
+          });
+          snoopChannel = null; // El engine lo creará cuando lo necesite
+        }
+
+      } catch (err) {
+        log('error', '❌ [SNOOP] Error verificando Snoop RX', {
+          error: err.message,
+          channelId: channel.id
+        });
+      }
 
       // 🩹 fallback por si Asterisk aún envía "s"
       const safeDnis =
@@ -555,6 +767,15 @@ AriClient.connect(
           await channel.answer()
             .then(() => log("info", `✅ Canal origen (${channel.name}) contestado`))
             .catch(err => log("warn", "Error al contestar origen", err.message));
+
+          // 🛡️ ACTIVAR TALK_DETECT OBLIGATORIO PARA VAD
+          // Sin esto, waitForRealVoice() siempre falla y no hay STT
+          try {
+            await channel.setChannelVar({ variable: 'TALK_DETECT(set)', value: '' });
+            log("info", "✅ TALK_DETECT activado en canal origen");
+          } catch (err) {
+            log("warn", `⚠️ Error activando TALK_DETECT: ${err.message}`);
+          }
 
           // 🧱 Crear bridge para la llamada interna
           const bridge = await ensureBridge(ari, bridgeId);
@@ -671,17 +892,82 @@ AriClient.connect(
           const botConfig = inboundConfig.bots[mode];
           log("info", `🤖 [ARI] VoiceBot Session Mode=${mode} (${botConfig.description}) ANI=${ani} DNIS=${safeDnis}`);
 
+          // 🛡️ CRÍTICO: Asignar rol al canal INMEDIATAMENTE para evitar hangup temprano
+          try {
+            // Guardar canal como A-leg para que el sistema sepa que está siendo manejado
+            await redis.set(`aleg:${linkedId}`, channel.id, { EX: 3600 });
+            await setJson(`channels:${linkedId}`, { a: channel.id }, 3600);
+            await redis.set(`activeCall:${channel.id}`, JSON.stringify({
+              channelId: channel.id,
+              linkedId,
+              ani,
+              dnis: safeDnis,
+              state: "Up",
+              role: "voicebot",
+              startedAt: new Date().toISOString()
+            }), { EX: 3600 });
+            log("info", `✅ [ROLE] Rol asignado inmediatamente: canal ${channel.id} → voicebot (linkedId: ${linkedId})`);
+          } catch (roleErr) {
+            log("warn", `⚠️ Error asignando rol al canal: ${roleErr.message}`);
+          }
+
           try { await channel.answer(); } catch { }
 
-          // === HARD GATE DE 1 SEGUNDO PARA EVITAR FALSOS SILENCIOS ===
+          // 🛡️ ACTIVAR TALK_DETECT OBLIGATORIO PARA VAD
+          try {
+            await channel.setChannelVar({ variable: 'TALK_DETECT(set)', value: '' });
+            log("info", "✅ TALK_DETECT activado para VoiceBot");
+          } catch (err) {
+            log("warn", `⚠️ Error activando TALK_DETECT: ${err.message}`);
+          }
+
+          // === PROTECCIÓN INTELIGENTE CON VERIFICACIÓN CONTINUA ===
           const callStartTime = Date.now();
+          const PROTECTION_MS = 500; // ✅ Reducido de 1000ms a 500ms
+          const CHECK_INTERVAL_MS = 100; // Verificar cada 100ms
 
-          // Esperamos un breve momento (protección) para asegurar que el canal esté listo
-          // y no sea detectado como silencio inmediatamente.
-          log("info", `🛡️ Protegiendo inicio de llamada para canal ${channel.id}, esperando 1000ms...`);
-          await new Promise(r => setTimeout(r, 1000));
+          log("info", `🛡️ Protegiendo inicio de llamada para canal ${channel.id}, esperando ${PROTECTION_MS}ms...`);
 
-          const elapsed = Date.now() - callStartTime;
+          let elapsed = 0;
+          let hangupDetected = false;
+
+          // Listener de hangup temprano
+          const hangupListener = (event, hungupChannel) => {
+            if (hungupChannel.id === channel.id) {
+              hangupDetected = true;
+              log("warn", `⚠️ Hangup detectado para canal ${channel.id} durante protección`);
+            }
+          };
+          ari.on("ChannelHangupRequest", hangupListener);
+
+          try {
+            while (elapsed < PROTECTION_MS) {
+              if (hangupDetected) {
+                log("warn", `⚠️ Cancelando inicialización: canal ${channel.id} se colgó durante protección`);
+                return; // Salir early
+              }
+
+              // ✅ Verificar si el canal sigue activo
+              try {
+                const channelState = await channel.get();
+                if (!channelState || channelState.state === 'Down') {
+                  log("warn", `⚠️ Canal ${channel.id} se colgó durante protección (${elapsed}ms), cancelando inicialización`);
+                  return; // Salir early
+                }
+              } catch (err) {
+                if (err.message && (err.message.includes('Channel not found') || err.message.includes('404'))) {
+                  log("warn", `⚠️ Canal ${channel.id} ya no existe (${elapsed}ms), cancelando inicialización`);
+                  return; // Salir early
+                }
+              }
+
+              await new Promise(r => setTimeout(r, CHECK_INTERVAL_MS));
+              elapsed = Date.now() - callStartTime;
+            }
+          } finally {
+            ari.removeListener("ChannelHangupRequest", hangupListener);
+          }
+
           log("info", `🛡️ Fin de protección para ${channel.id} (${elapsed}ms elapsed)`);
 
           // === VALIDACIÓN ANTIRRUIDO MULTINIVEL (DESHABILITADA) ===
@@ -706,17 +992,69 @@ AriClient.connect(
           log("info", `🤖 Iniciando sesión de VoiceBot (${mode}) para canal ${channel.id} (${ani} → ${safeDnis})`);
 
           try {
-            const capsule = await resolveClientCapsule(mode);
-            // Fix: Pass 'mode' as promptFile (string), not event.args (array)
-            await startVoiceBotSessionV3(ari, channel, ani, dnis, linkedId, mode, {
-              domain: capsule,
-              mode: mode,
-              botName: capsule ? 'Capsule' : 'Legacy',
-              systemPrompt: capsule ? capsule.systemPrompt : undefined, // ✅ Inject System Prompt
-              state: {} // ✅ State persistence for V3 Engine
+            const rawCapsule = await resolveClientCapsule(mode);
+
+            // 🛡️ VALIDACIÓN CRÍTICA: Verificar que capsule existe
+            if (!rawCapsule) {
+              log("error", `❌ [ARI] Capsule no encontrado para mode=${mode} - No se puede iniciar VoiceBot`);
+              await channel.hangup().catch(() => { });
+              return;
+            }
+
+            // 🎯 NORMALIZACIÓN Y VALIDACIÓN: Usar contrato oficial
+            const capsule = validateAndNormalizeCapsule(rawCapsule, mode);
+
+            if (!capsule) {
+              log("error", `❌ [ARI] Capsule inválida para mode=${mode} - No cumple contrato. No se puede iniciar VoiceBot`, {
+                rawCapsuleType: typeof rawCapsule,
+                rawCapsuleKeys: rawCapsule && typeof rawCapsule === 'object' ? Object.keys(rawCapsule) : 'N/A'
+              });
+              await channel.hangup().catch(() => { });
+              return;
+            }
+
+            log("info", `✅ [ARI] Capsule validada y normalizada para mode=${mode}`, {
+              capsuleType: typeof capsule,
+              domainFunctionExists: typeof capsule.domain === 'function',
+              domainName: capsule.domainName || 'unknown',
+              botName: capsule.botName || 'unknown',
+              hasSystemPrompt: typeof capsule.systemPrompt === 'string',
+              sttMode: capsule.sttMode || 'none'
             });
+
+            // 🎯 CONTRATO ESTÁNDAR: Crear domainContext con estructura validada
+            const domainContext = {
+              domain: capsule.domain, // ✅ Función validada
+              domainName: capsule.domainName || mode,
+              mode: mode,
+              botName: capsule.botName || 'Capsule',
+              systemPrompt: capsule.systemPrompt, // ✅ Inject System Prompt
+              sttMode: capsule.sttMode, // ✅ Inject STT Mode (Legacy/Realtime)
+              state: {}, // ✅ State persistence for V3 Engine
+              audioChannelId: snoopChannel?.id // ✅ Pass Snoop Channel ID for STT
+            };
+
+            log("info", `🚀 [ARI] Iniciando VoiceBot con domainContext validado:`, {
+              domainContextProvided: !!domainContext,
+              domainFunctionExists: typeof domainContext.domain === 'function',
+              domainName: domainContext.domainName,
+              botName: domainContext.botName,
+              hasSystemPrompt: !!domainContext.systemPrompt,
+              sttMode: domainContext.sttMode || 'realtime',
+              audioChannelId: domainContext.audioChannelId || 'none',
+              mode: mode
+            });
+
+            await startVoiceBotSessionV3(ari, channel, ani, dnis, linkedId, mode, domainContext);
           } catch (err) {
-            log("error", `❌ Error iniciando VoiceBot V3: ${err.message}`);
+            log("error", `❌ Error iniciando VoiceBot V3: ${err.message}`, {
+              errorType: err.constructor.name,
+              errorMessage: err.message,
+              errorStack: err.stack,
+              mode: mode,
+              channelId: channel.id,
+              linkedId: linkedId
+            });
             await channel.hangup().catch(() => { });
           }
           return;
@@ -767,6 +1105,248 @@ AriClient.connect(
       } catch (e) {
         log("error", "Error en StasisStart", e.message);
       }
+    });
+
+    // ------------------------------------------------------
+    // 🕵️‍♂️ SNOOP HANDLER (RX-only)
+    // ------------------------------------------------------
+    ari.on("StasisStart", async (event, channel) => {
+      // ✅ LOG 3: Listener global de StasisStart RAW (antes de cualquier filtro)
+      if (event.application === SNOOP_APP) {
+        log("debug", "🔔 [ARI] StasisStart RAW (SNOOP)", {
+          channelId: channel.id,
+          name: channel.name,
+          app: event.application,
+          args: event.args || [],
+          channelState: channel.state,
+          linkedId: channel.linkedid || channel.id,
+          timestamp: Date.now()
+        });
+      }
+
+      if (event.application !== SNOOP_APP) return;
+
+      log('info', '🕵️‍♂️ [SNOOP] Canal RX activo', {
+        snoopChannelId: channel.id,
+        name: channel.name
+      });
+      // ✅ [SNOOP] STT Configured via VoiceEngine
+      // sttManager.setInputChannel(channel.id);
+
+      // 🎯 CONTRATO: Transicionar Snoop de WAITING_AST a READY cuando llega StasisStart
+      // Este es el ÚNICO evento que confirma que el Snoop está realmente listo
+      try {
+        // Importar funciones del contrato dinámicamente para evitar circular dependencies
+        const { getSnoopContract, transitionSnoopState, SnoopState, extractParentChannelIdFromSnoopName } = await import("../engine/contracts/snoop.contract.js");
+
+        // 🎯 CRÍTICO: Buscar contrato por múltiples métodos (correlación robusta)
+        // 1. Por snoopId (índice secundario)
+        // 2. Por nombre del Snoop (extrae parentChannelId)
+
+        // Extraer parentChannelId del nombre del Snoop (formato: Snoop/PARENT_ID-xxxxx)
+        const parentChannelIdFromName = extractParentChannelIdFromSnoopName(channel.name);
+
+        // ✅ FIX: Buscar contrato por snoopId Y por nombre (doble búsqueda para robustez)
+        let contract = await getSnoopContract(channel.id); // Buscar por snoopId
+        if (!contract && parentChannelIdFromName) {
+          // Si no se encontró por snoopId, intentar por parentChannelId (linkedId del contrato)
+          contract = await getSnoopContract(parentChannelIdFromName);
+        }
+
+        // ✅ LOG 4: Correlación StasisStart → Contrato (mejorado)
+
+        // ✅ FIX: Parsear linkedId desde args (formato: 'linkedId=1769029464.1446' o directamente el valor)
+        let linkedIdFromArgs = null;
+        if (event.args && event.args.length > 0) {
+          const firstArg = event.args[0];
+          if (typeof firstArg === 'string') {
+            // Parsear formato 'linkedId=VALUE' o usar directamente si es solo el valor
+            if (firstArg.includes('=')) {
+              const parts = firstArg.split('=');
+              if (parts[0] === 'linkedId' && parts[1]) {
+                linkedIdFromArgs = parts[1];
+              }
+            } else {
+              linkedIdFromArgs = firstArg;
+            }
+          }
+        }
+        linkedIdFromArgs = linkedIdFromArgs || channel.linkedid || channel.id;
+
+        log("info", "🔗 [SNOOP CORRELATION CHECK]", {
+          channelId: channel.id,
+          channelName: channel.name,
+          parentChannelIdFromName,
+          linkedIdFromArgs,
+          linkedIdFromChannel: channel.linkedid,
+          rawArgs: event.args,
+          contractExists: !!contract,
+          contractState: contract?.state,
+          contractSnoopId: contract?.snoopId,
+          contractLinkedId: contract?.linkedId,
+          contractParentChannelId: contract?.parentChannelId,
+          correlationMatch: contract && (contract.snoopId === channel.id || contract.parentChannelId === parentChannelIdFromName),
+          timestamp: Date.now()
+        });
+
+        // ✅ FIX: Correlación mejorada - verificar por snoopId O por parentChannelId del nombre
+        if (contract && (contract.snoopId === channel.id || contract.parentChannelId === parentChannelIdFromName)) {
+          // 🎯 Obtener linkedId del caller desde el contrato
+          const callerLinkedId = contract.linkedId;
+
+          // ✅ LOG: Decisión READY
+          log("info", "🎯 [SNOOP READY DECISION]", {
+            snoopId: channel.id,
+            contractState: contract.state,
+            linkedIdMatch: contract.linkedId === callerLinkedId,
+            parentChannelMatch: contract.parentChannelId === parentChannelIdFromName,
+            reason: "StasisStart received - transitioning to READY"
+          });
+
+          // 🎯 EVENT-DRIVEN CONTRACT: StasisStart es la única fuente de verdad para READY
+          // ✅ FIX: Transición idempotente - permitir CREATED → READY o WAITING_AST → READY directamente
+          // No necesitamos pasar por WAITING_AST si StasisStart llega cuando está en CREATED
+          if (contract.state === SnoopState.CREATED || contract.state === SnoopState.WAITING_AST) {
+            try {
+              // ✅ FIX: Usar el estado actual del contrato como "from" (idempotencia)
+              const fromState = contract.state;
+
+              // ✅ PRIORIDAD 0: Usar channel.state del evento StasisStart como fuente de verdad
+              // El evento StasisStart es la fuente de verdad - si el canal está en Stasis, está Up
+              // channels.get() puede fallar por race condition (canal aún no indexado en REST API)
+              const channelStateFromEvent = channel.state; // 'Up', 'Ring', 'Ringing', etc.
+
+              // Verificación opcional vía REST API (no bloqueante)
+              let channelStateFromAPI = null;
+              try {
+                channelStateFromAPI = await ari.Channel().get({ channelId: channel.id });
+              } catch (channelErr) {
+                // No fatal - el evento StasisStart ya confirma que el canal existe
+                log("debug", `[SNOOP] channels.get() falló (no crítico, StasisStart es fuente de verdad): ${channelErr.message}`);
+              }
+
+              // ✅ REGLA 1: StasisStart es la única fuente de verdad para READY
+              // Si recibimos StasisStart del Snoop, el canal está materializado y listo
+              // NO dependemos de channels.get() - puede fallar por race condition
+              // El evento StasisStart ya confirma que el canal existe en Stasis
+
+              // ✅ Log decisivo de sincronización
+              log("info", "📊 [SNOOP_SYNC_VERIFICATION]", {
+                snoopId: channel.id,
+                channelStateFromEvent,
+                channelStateFromAPI: channelStateFromAPI?.state || 'N/A',
+                channelsGetSuccess: !!channelStateFromAPI,
+                sourceOfTruth: 'StasisStart_event',
+                decision: 'READY_by_StasisStart'
+              });
+
+              // ✅ REGLA 1: StasisStart recibido = READY (sin verificación adicional de channels.get())
+              // El evento StasisStart es la materialización - no necesitamos channels.get()
+
+              // ✅ PRIORIDAD 3: Anclar inmediatamente al capture bridge si existe
+              let captureBridgeId = null;
+              try {
+                const { getSnoopContract } = await import("../engine/contracts/snoop.contract.js");
+                const currentContract = await getSnoopContract(callerLinkedId);
+
+                if (currentContract && currentContract.captureBridgeId) {
+                  captureBridgeId = currentContract.captureBridgeId;
+                  const captureBridge = ari.Bridge();
+                  captureBridge.id = captureBridgeId;
+
+                  try {
+                    await captureBridge.addChannel({ channel: channel.id });
+                    log("info", `🔗 [SNOOP] Snoop ${channel.id} anclado inmediatamente al capture bridge ${captureBridgeId}`);
+                  } catch (anchorErr) {
+                    // No fatal - puede que ya esté anclado
+                    log("debug", `[SNOOP] Error anclando Snoop al bridge (puede que ya esté anclado): ${anchorErr.message}`);
+                  }
+                }
+              } catch (anchorErr) {
+                log("debug", `[SNOOP] Error obteniendo contrato para anclaje: ${anchorErr.message}`);
+              }
+
+              // ✅ FIX: Transición idempotente - usar estado actual como "from"
+              await transitionSnoopState(callerLinkedId, fromState, SnoopState.READY, {
+                stasisStartReceived: true,
+                stasisStartAt: Date.now(),
+                channelState: channelStateFromEvent, // Usar estado del evento, no de API
+                channelStateFromAPI: channelStateFromAPI?.state || 'N/A',
+                channelName: channel.name,
+                captureBridgeId: captureBridgeId
+              });
+
+              log("info", `✅ [SNOOP CONTRACT] Snoop ${channel.id} transicionado ${fromState} → READY por StasisStart (materializado y verificado)`, {
+                linkedId: callerLinkedId,
+                fromState,
+                channelStateFromEvent,
+                channelStateFromAPI: channelStateFromAPI?.state || 'N/A',
+                channelName: channel.name
+              });
+
+              // 🎯 CRÍTICO: Marcar Snoop como activo en Redis SOLO cuando está READY
+              await redis.set(`snoop:active:${callerLinkedId}`, channel.id, { EX: 3600 }).catch(err => {
+                log("warn", `⚠️ [SNOOP] Error guardando Snoop activo en Redis: ${err.message}`);
+              });
+            } catch (transitionErr) {
+              log("error", `❌ [SNOOP CONTRACT] Error transicionando a READY: ${transitionErr.message}`, {
+                linkedId: callerLinkedId,
+                snoopId: channel.id,
+                currentState: contract.state,
+                error: transitionErr.message
+              });
+            }
+          } else if (contract.state === SnoopState.READY) {
+            log("debug", `🔄 [SNOOP CONTRACT] StasisStart recibido pero Snoop ${channel.id} ya está en ${contract.state}`, { linkedId: callerLinkedId });
+            // Asegurar que Redis está marcado (por si acaso)
+            await redis.set(`snoop:active:${callerLinkedId}`, channel.id, { EX: 3600 }).catch(err => {
+              log("warn", `⚠️ [SNOOP] Error guardando Snoop activo en Redis: ${err.message}`);
+            });
+          } else {
+            // ✅ LOG: Evento descartado
+            log("warn", `⚠️ [SNOOP EVENT DROPPED] StasisStart recibido pero Snoop ${channel.id} está en estado inesperado`, {
+              linkedId: callerLinkedId,
+              snoopId: channel.id,
+              currentState: contract.state,
+              reason: `state=${contract.state} not in [CREATED, WAITING_AST, READY, ANCHORED]`
+            });
+          }
+        } else {
+          // ✅ LOG: Evento descartado por falta de correlación
+          log("warn", `⚠️ [SNOOP EVENT DROPPED] StasisStart recibido pero no hay contrato para Snoop ${channel.id} o correlación falló`, {
+            snoopId: channel.id,
+            channelName: channel.name,
+            parentChannelIdFromName,
+            contractSnoopId: contract?.snoopId,
+            contractLinkedId: contract?.linkedId,
+            contractParentChannelId: contract?.parentChannelId,
+            reason: contract ? "snoopId/parentChannelId mismatch" : "contract not found"
+          });
+        }
+      } catch (contractErr) {
+        log("error", `❌ [SNOOP CONTRACT] Error transicionando contrato por StasisStart: ${contractErr.message}`, { snoopId: channel.id });
+      }
+
+      // ⚠️ NO bridgear
+      // ⚠️ NO playback
+      // ⚠️ SOLO escuchar
+    });
+
+    ari.on("StasisEnd", (event, channel) => {
+      if (event.application !== SNOOP_APP) return;
+      log("info", "🛑 [SNOOP] Snoop finalizado", { channelId: channel.id });
+
+      // 📊 MEJORA B: Métrica de lifetime del Snoop
+      const linkedId = channel.linkedid || channel.id;
+      redis.get(`snoop:lifetime:${channel.id}:created`).then(createdStr => {
+        if (createdStr) {
+          const created = parseInt(createdStr);
+          const destroyed = Date.now();
+          const lifetime = destroyed - created;
+          log("info", `📊 [SNOOP_LIFETIME] Snoop ${channel.id} vivió ${lifetime}ms (created=${created}, destroyed=${destroyed})`);
+          redis.set(`snoop:lifetime:${channel.id}:destroyed`, String(destroyed), { EX: 3600 }).catch(() => { });
+        }
+      }).catch(() => { });
     });
 
     // ------------------------------------------------------
@@ -852,15 +1432,21 @@ AriClient.connect(
           }
 
           // 🟣 --- 2️⃣ Iniciar grabación usando servicio central ---
-          try {
-            const tenantId = channel?.variables?.TENANT_ID || channel?.variables?.TENANTID || process.env.DEFAULT_TENANT || "default";
-            const { name: recName } = await startRecording(ari, channel, tenantId, linkedId, ani, dnis);
-            if (recName) {
-              await redis.set(`recording:${linkedId}`, recName, { EX: 3600 });
-              log("info", `🎙️ Handle de grabación guardado en Redis: recording:${linkedId} -> ${recName}`);
+          // 🛡️ PROTECCIÓN: No grabar canales STT (ExternalMedia) - estos se graban manualmente en voice-engine
+          // 🎯 FIX: NO ignorar canales STT/UnicastRTP - son críticos para el flujo de audio
+          if (false) { // Deshabilitado: estos canales NO deben ignorarse
+            log("debug", `🚫 [ARI] Grabación automática omitida para canal STT: ${channel.id}`);
+          } else {
+            try {
+              const tenantId = channel?.variables?.TENANT_ID || channel?.variables?.TENANTID || process.env.DEFAULT_TENANT || "default";
+              const { name: recName } = await startRecording(ari, channel, tenantId, linkedId, ani, dnis);
+              if (recName) {
+                await redis.set(`recording:${linkedId}`, recName, { EX: 3600 });
+                log("info", `🎙️ Handle de grabación guardado en Redis: recording:${linkedId} -> ${recName}`);
+              }
+            } catch (err) {
+              log("warn", "No se pudo iniciar grabación", err.message);
             }
-          } catch (err) {
-            log("warn", "No se pudo iniciar grabación", err.message);
           }
 
           // ✅ --- Cancelar guard de timeout ---
@@ -907,14 +1493,33 @@ AriClient.connect(
         const snapshot = await getJson(stateKey);
         const st = snapshot?.state || channel.state;
 
-        // 🆕 DETECTAR ROL: A-leg o B-leg
-        const bLegId = await redis.get(`aleg:${channel.id}:bleg`);
-        const aLegId = await redis.get(`bleg:${channel.id}:aleg`);
+        // 🆕 DETECTAR ROL: Leer desde activeCall (fuente de verdad) o fallback a A-leg/B-leg
+        const activeCallData = await getJson(`activeCall:${channel.id}`);
+        let role = activeCallData?.role || 'Unknown';
 
-        const isAleg = !!bLegId;
-        const isBleg = !!aLegId;
+        // Detectar A-leg o B-leg si no hay rol en activeCall
+        let isAleg = false;
+        let isBleg = false;
 
-        log("info", `📞 ChannelHangupRequest: ${channel.id} (ANI: ${ani}, DNIS: ${dnis}, State: ${st}, Role: ${isAleg ? 'A-leg' : isBleg ? 'B-leg' : 'Unknown'})`);
+        if (role === 'Unknown') {
+          const bLegId = await redis.get(`aleg:${channel.id}:bleg`);
+          const aLegId = await redis.get(`bleg:${channel.id}:aleg`);
+          isAleg = !!bLegId;
+          isBleg = !!aLegId;
+          if (isAleg) role = 'A-leg';
+          else if (isBleg) role = 'B-leg';
+        } else {
+          // Si el rol ya venía definido, inferir flags
+          isAleg = role === 'A-leg';
+          isBleg = role === 'B-leg';
+        }
+
+        log("info", `📞 ChannelHangupRequest: ${channel.id} (ANI: ${ani}, DNIS: ${dnis}, State: ${st}, Role: ${role})`);
+
+        // ⚠️ Warning solo si realmente no hay rol definido
+        if (role === 'Unknown') {
+          log("warn", `⚠️ Hangup de canal sin rol definido: ${channel.id}`);
+        }
 
         // 🔴 CASO CRÍTICO: A-LEG CORTA (origen cancela)
         if (isAleg) {
@@ -967,7 +1572,7 @@ AriClient.connect(
         }
 
         // 🟡 CASO GENÉRICO: Canal sin relación explícita (fallback)
-        log("warn", `⚠️ Hangup de canal sin rol definido: ${channel.id}`);
+        // ⚠️ Warning ya emitido arriba si role === 'Unknown'
 
         await publishHangupOnce(channel, {
           channelId: channel.id,
@@ -1137,6 +1742,9 @@ AriClient.connect(
         }
 
         // 🧹 Publicar fin del canal actual
+        // [MOD] Deshabilitado: ChannelLeftBridge no implica fin de llamada en V3 (Playback, etc.)
+        // Se delega la limpieza final a StasisEnd.
+        /*
         const key = `activeCall:${id}`;
         const callData = await redis.get(key);
         if (callData) {
@@ -1150,8 +1758,11 @@ AriClient.connect(
 
         // 🧹 Limpieza completa
         await hangupOriginAndCleanup(ari, linkedId, id);
+        */
 
         // 💥 Destruir bridge si existe
+        // [MOD] Deshabilitado para permitir bridges persistentes en VoiceBot V3
+        /*
         if (bridgeId) {
           try {
             const b = ari.Bridge();
@@ -1164,6 +1775,7 @@ AriClient.connect(
             }
           }
         }
+        */
 
       } catch (err) {
         log("error", "Error manejando ChannelLeftBridge", err);
@@ -1211,6 +1823,8 @@ AriClient.connect(
       }
     }
 
+    // [MOD] Deshabilitado por redundancia con el handler principal (línea 903)
+    /*
     // Captura hangup del origen
     ari.on("ChannelHangupRequest", async (event, channel) => {
       const linkedId = channel.linkedid || channel.id;
@@ -1224,6 +1838,7 @@ AriClient.connect(
         await forceHangupPair(ari, linkedId, channel.id, reason);
       }
     });
+    */
 
     // ------------------------------------------------------
     // 🔚 STASIS END
@@ -1269,9 +1884,9 @@ AriClient.connect(
     });
 
     // ------------------------------------------------------
-    // 🚀 Iniciar App ARI
+    // 🚀 Iniciar App ARI (Main + Snoop)
     // ------------------------------------------------------
-    ari.start(APP);
+    ari.start([APP, SNOOP_APP]);
 
     // ------------------------------------------------------
     // 🏥 Redis Healthcheck

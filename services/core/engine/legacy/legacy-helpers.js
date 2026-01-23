@@ -20,7 +20,8 @@ const VOICEBOT_PATH = config.paths.voicebot;
 const ASTERISK_REC_PATH = config.paths.recordings;
 const MAX_WAIT_MS = config.audio.maxWaitMs || 4000;
 const MIN_TALKING_EVENT = config.audio.minTalkingEvents || 3;
-const TALKING_DEBOUNCE_MS = config.audio.talkingDebounceMs || 300;
+// 🎯 MEJORA FLUIDEZ: Usar valor de config (150ms) en lugar de 300ms por defecto
+const TALKING_DEBOUNCE_MS = config.audio.talkingDebounceMs || 150;
 const PLAYBACK_TIMEOUT_MS = config.audio.playbackTimeoutMs || 30000;
 const SILENCE_THRESHOLD_SEC = config.audio.maxSilenceSeconds || 2;
 const MAX_RECORDING_MS = config.audio.maxRecordingMs || 15000;
@@ -40,7 +41,10 @@ export async function waitForFile(path, timeoutMs = 3000, intervalMs = 100) {
 
 export async function waitForRealVoice(channel, {
     maxWaitMs = MAX_WAIT_MS,
-    minTalkingEvents = MIN_TALKING_EVENT
+    minTalkingEvents = MIN_TALKING_EVENT,
+    postPlaybackGuardMs = 0,
+    lastPlaybackEnd = 0,
+    checkDeltaEvidence = null // 🎯 NUEVO: Callback para verificar evidencia de deltas
 } = {}) {
     // 🛡️ Verificar canal antes de suscribir listeners
     try {
@@ -57,12 +61,23 @@ export async function waitForRealVoice(channel, {
         let talkingEvents = 0;
         let finished = false;
         let timer = null;
+        let deltaCheckInterval = null; // 🎯 NUEVO: Interval para verificar deltas
 
         const handler = (event, chan) => {
             // Filtrar evento para el canal correcto
             if (!chan || chan.id !== channel.id) return;
 
             talkingEvents++;
+
+            // 🛡️ PLAYBACK GUARD
+            if (lastPlaybackEnd > 0) {
+                const timeSincePlayback = Date.now() - lastPlaybackEnd;
+                if (timeSincePlayback < postPlaybackGuardMs) {
+                    log("debug", `🛡️ [VAD] Ignorando voz durante guard time (${timeSincePlayback}ms < ${postPlaybackGuardMs}ms)`);
+                    return;
+                }
+            }
+
             //log("debug", `🗣️ [VAD] Voz detectada (${talkingEvents}/${minTalkingEvents})`);
 
             if (talkingEvents >= minTalkingEvents) {
@@ -72,10 +87,25 @@ export async function waitForRealVoice(channel, {
             }
         };
 
+        // 🎯 NUEVO: Verificar evidencia de deltas periódicamente durante la espera
+        if (checkDeltaEvidence && typeof checkDeltaEvidence === 'function') {
+            deltaCheckInterval = setInterval(async () => {
+                if (finished) return;
+                
+                const hasEvidence = await checkDeltaEvidence();
+                if (hasEvidence) {
+                    log("info", `🎤 [VAD HÍBRIDO] Voz detectada por deltas durante waitForRealVoice`);
+                    cleanup();
+                    resolve(true); // Se detectó voz por deltas
+                }
+            }, 300); // Verificar cada 300ms (balance entre latencia y carga)
+        }
+
         const cleanup = () => {
             if (finished) return;
             finished = true;
             if (timer) clearTimeout(timer);
+            if (deltaCheckInterval) clearInterval(deltaCheckInterval);
             channel.removeListener("ChannelTalkingStarted", handler);
         };
 
@@ -117,34 +147,46 @@ export async function convertWavToWav8000(inputWav, outputWav) {
     }
 }
 
-export async function playWithBargeIn(ari, channel, fileBaseName, openaiClient, options = {}) {
+export async function playWithBargeIn(ari, channel, fileBaseName, openaiClient, options = {}, voiceBridgeRef = null) {
+    // 🛡️ Protección básica
+    if (!channel || !channel.id || !fileBaseName) {
+        log("warn", `⚠️ [PLAYBACK] Parámetros inválidos, omitiendo playback`);
+        if (openaiClient) openaiClient.isPlaybackActive = false;
+        return { reason: "invalid_params" };
+    }
+
     // 🛡️ Protección: Verificar que el canal existe antes de reproducir
     try {
         const channelState = await channel.get();
         if (!channelState || channelState.state === 'Down') {
-            log("debug", `🔇 [VB V3] Canal no disponible para playback (estado: ${channelState?.state || 'null'}), omitiendo`);
+            log("warn", `🔇 [VB V3] Canal no disponible para playback (estado: ${channelState?.state || 'null'}), omitiendo`);
             if (openaiClient) openaiClient.isPlaybackActive = false;
-            return { reason: "channel_down" };
+            return { reason: "channel_down", skipped: true };
         }
     } catch (err) {
-        log("debug", `🔇 [VB V3] No se pudo verificar estado del canal: ${err.message}, omitiendo playback`);
+        if (err.message && (err.message.includes('Channel not found') || err.message.includes('404'))) {
+            log("warn", `🔇 [VB V3] Canal ${channel.id} ya no existe (hangup temprano), omitiendo playback`);
+        } else {
+            log("warn", `🔇 [VB V3] No se pudo verificar estado del canal: ${err.message}, omitiendo playback`);
+        }
         if (openaiClient) openaiClient.isPlaybackActive = false;
-        return { reason: "channel_not_found" };
+        return { reason: "channel_not_found", skipped: true };
     }
 
     const allowBargeIn = options.bargeIn !== false;
     const media = `sound:voicebot/${fileBaseName}`;
 
-    const playback = ari.Playback();
-
     log("info", `🔊 [VB V3] Reproduciendo (barge-in ${allowBargeIn ? 'si' : 'no'}): ${media}`);
-    if (openaiClient) openaiClient.isPlaybackActive = true;
-
+    if (openaiClient) {
+        openaiClient.isPlaybackActive = true;
+        log("info", "🔇 [STT] Pausado por inicio de playback");
+    }
 
     return new Promise((resolve) => {
         let bargedIn = false;
         let finished = false;
         let talkingTimer = null;
+        let playbackInstance = null; // Se asignará según bridge o channel
         const startedAt = Date.now();
 
         const talkingHandler = (event, chan) => {
@@ -163,9 +205,11 @@ export async function playWithBargeIn(ari, channel, fileBaseName, openaiClient, 
                     openaiClient.cancelCurrentResponse("user_barge_in");
                 }
 
-                playback.stop().catch((err) =>
-                    log("warn", `⚠️ Error deteniendo playback: ${err.message}`)
-                );
+                if (playbackInstance) {
+                    playbackInstance.stop().catch((err) =>
+                        log("warn", `⚠️ Error deteniendo playback: ${err.message}`)
+                    );
+                }
             }, TALKING_DEBOUNCE_MS);
         };
 
@@ -175,32 +219,87 @@ export async function playWithBargeIn(ari, channel, fileBaseName, openaiClient, 
             channel.removeListener("ChannelTalkingStarted", talkingHandler);
         };
 
+        const registerPlaybackListeners = (playbackObj) => {
+            const playbackStartTime = Date.now();
+            // 🎯 FIX: Considerar bridge.play() como START confirmado (ARI a veces no emite PlaybackStarted)
+            // Si playbackObj ya tiene un ID, significa que bridge.play() retornó exitosamente = started
+            let playbackStartedReceived = playbackObj?.id ? true : false;
+            
+            if (playbackStartedReceived) {
+                log("info", `🎵 [PLAYBACK] PlaybackStarted confirmado por bridge.play() exitoso (playbackId=${playbackObj.id})`);
+            }
+            
+            playbackObj.on("PlaybackStarted", () => {
+                playbackStartedReceived = true;
+                const timeToStart = Date.now() - playbackStartTime;
+                log("info", `🎵 [PLAYBACK] PlaybackStarted recibido para ${media} (tiempo hasta inicio: ${timeToStart}ms)`);
+            });
+            
+            playbackObj.on("PlaybackFinished", () => {
+                if (finished) return;
+                const duration = Date.now() - playbackStartTime;
+                if (openaiClient) {
+                    openaiClient.isPlaybackActive = false;
+                    log("info", "🎧 [STT] Reanudado tras playback");
+                }
+                
+                // 🛡️ DETECCIÓN CRÍTICA: Playback completado sin iniciar o demasiado rápido
+                // 🎯 FIX: Usar playback.id como referencia (no mediaPath)
+                const playbackId = playbackObj?.id || 'unknown';
+                if (!playbackStartedReceived) {
+                    log("error", `❌ [PLAYBACK] PlaybackFinished recibido SIN PlaybackStarted para ${media} (playbackId=${playbackId}) - archivo no encontrado o bridge mal configurado`);
+                } else if (duration < 100) {
+                    log("warn", `⚠️ [PLAYBACK] Playback completado demasiado rápido (${duration}ms) - posible archivo vacío o corrupto`);
+                } else {
+                    log("info", `✅ Playback completado: ${media} (duración: ${duration}ms, playbackId=${playbackId})`);
+                }
+                cleanup();
+                resolve({ reason: bargedIn ? "barge-in" : "finished" });
+            });
+
+            playbackObj.on("PlaybackStopped", () => {
+                if (finished) return;
+                const duration = Date.now() - playbackStartTime;
+                if (openaiClient) {
+                    openaiClient.isPlaybackActive = false;
+                    log("info", "🎧 [STT] Reanudado tras playback (stopped)");
+                }
+                log("debug", `🛑 Playback detenido: ${media} (duración: ${duration}ms)`);
+                cleanup();
+                resolve({ reason: bargedIn ? "barge-in" : "stopped" });
+            });
+
+            playbackObj.on("PlaybackFailed", (evt) => {
+                if (finished) return;
+                const duration = Date.now() - playbackStartTime;
+                if (openaiClient) {
+                    openaiClient.isPlaybackActive = false;
+                    log("info", "🎧 [STT] Reanudado tras playback (failed)");
+                }
+                
+                // 🔍 DIAGNÓSTICO DETALLADO: El evento puede contener información sobre por qué falló
+                const errorDetails = {
+                    media: media,
+                    duration: `${duration}ms`,
+                    event: evt,
+                    startedReceived: playbackStartedReceived,
+                    possibleCauses: []
+                };
+                
+                if (!playbackStartedReceived) {
+                    errorDetails.possibleCauses.push("Archivo de audio no encontrado en Asterisk");
+                }
+                if (duration < 50) {
+                    errorDetails.possibleCauses.push("Playback falló inmediatamente - posible problema de permisos o formato");
+                }
+                
+                log("error", `❌ [PLAYBACK] Playback falló: ${JSON.stringify(errorDetails)}`);
+                cleanup();
+                resolve({ reason: "failed" });
+            });
+        };
+
         channel.on("ChannelTalkingStarted", talkingHandler);
-
-        playback.on("PlaybackFinished", () => {
-
-            if (finished) return;
-            if (openaiClient) openaiClient.isPlaybackActive = false;
-            log("debug", `✅ Playback completado: ${media}`);
-            cleanup();
-            resolve({ reason: bargedIn ? "barge-in" : "finished" });
-        });
-
-        playback.on("PlaybackStopped", () => {
-            if (finished) return;
-            if (openaiClient) openaiClient.isPlaybackActive = false;
-            log("debug", `🛑 Playback detenido: ${media}`);
-            cleanup();
-            resolve({ reason: bargedIn ? "barge-in" : "stopped" });
-        });
-
-        playback.on("PlaybackFailed", (evt) => {
-            if (finished) return;
-            if (openaiClient) openaiClient.isPlaybackActive = false;
-            log("error", `❌ Playback falló: ${JSON.stringify(evt)}`);
-            cleanup();
-            resolve({ reason: "failed" });
-        });
 
         const timeoutTimer = setInterval(() => {
             if (finished) {
@@ -209,21 +308,93 @@ export async function playWithBargeIn(ari, channel, fileBaseName, openaiClient, 
             }
             if (Date.now() - startedAt > PLAYBACK_TIMEOUT_MS) {
                 log("warn", `⏰ Timeout en playback: ${media}`);
-                playback.stop().catch((err) =>
-                    log("warn", `⚠️ Error timeout playback: ${err.message}`)
-                );
+                if (playbackInstance) {
+                    playbackInstance.stop().catch((err) =>
+                        log("warn", `⚠️ Error timeout playback: ${err.message}`)
+                    );
+                }
                 clearInterval(timeoutTimer);
             }
         }, 500);
 
-        channel
-            .play({ media }, playback)
-            .catch((err) => {
+        // 🎯 VERDAD ARQUITECTÓNICA: Si existe Voice Bridge, el playback DEBE ir por el bridge
+        const startPlayback = async () => {
+            try {
+                if (voiceBridgeRef?.current) {
+                    // 🛡️ CRÍTICO: Verificar que el bridge tenga canales antes de reproducir
+                    const bridgeInfo = await voiceBridgeRef.current.get();
+                    const hasChannels = Array.isArray(bridgeInfo.channels) && bridgeInfo.channels.length > 0;
+                    
+                    // 🔍 INFO level para diagnóstico forense (siempre visible)
+                    log("info", `🔍 [PLAYBACK] Bridge ${voiceBridgeRef.current.id} estado: channels=${bridgeInfo.channels?.length || 0}, bridgeType=${bridgeInfo.bridge_type || 'unknown'}, bridgeClass=${bridgeInfo.bridge_class || 'unknown'}`);
+                    
+                    if (!hasChannels) {
+                        log("warn", `⚠️ [PLAYBACK] Bridge ${voiceBridgeRef.current.id} no tiene canales, usando channel.play() como fallback`);
+                        // Fallback a canal si el bridge está vacío
+                        const channelPlayback = ari.Playback();
+                        playbackInstance = channelPlayback;
+                        registerPlaybackListeners(channelPlayback);
+                        await channel.play({ media }, channelPlayback);
+                        return;
+                    }
+                    
+                    log("info", `🔊 [PLAYBACK] Bridge.play (${voiceBridgeRef.current.id}, channels: ${bridgeInfo.channels.length}) → ${media}`);
+                    // bridge.play() devuelve un objeto Playback, no acepta uno como parámetro
+                    try {
+                        playbackInstance = await voiceBridgeRef.current.play({ media });
+                        
+                        // 🛡️ VALIDACIÓN CRÍTICA: Verificar que el playback se creó correctamente
+                        if (!playbackInstance) {
+                            log("error", `❌ [PLAYBACK] bridge.play() retornó null/undefined para ${media}`);
+                            throw new Error("Playback instance is null");
+                        }
+                        
+                    log("info", `✅ [PLAYBACK] Bridge.play iniciado, playbackId=${playbackInstance.id || 'unknown'}, media=${media}`);
+                    
+                    // Registrar listeners (maneja PlaybackStarted, PlaybackFinished, etc.)
+                    // 🎯 FIX: Registrar listeners DESPUÉS de que bridge.play() retorna (playbackInstance ya tiene ID)
+                    registerPlaybackListeners(playbackInstance);
+                    
+                    // 🎯 FIX ADICIONAL: Si playbackInstance.id existe, marcar como started inmediatamente
+                    // Esto asegura que el flag esté set antes de que llegue cualquier evento
+                    if (playbackInstance.id) {
+                        log("info", `🎵 [PLAYBACK] PlaybackStarted confirmado por bridge.play() exitoso (playbackId=${playbackInstance.id})`);
+                    }
+                    } catch (playErr) {
+                        log("error", `❌ [PLAYBACK] Error en bridge.play(): ${playErr.message}, stack: ${playErr.stack}`);
+                        throw playErr; // Re-lanzar para que el catch externo lo maneje
+                    }
+                } else {
+                    // Fallback legacy (backward compatibility)
+                    log("info", `🔊 [PLAYBACK] Channel.play (legacy) → ${media}`);
+                    const channelPlayback = ari.Playback();
+                    playbackInstance = channelPlayback;
+                    registerPlaybackListeners(channelPlayback);
+                    await channel.play({ media }, channelPlayback);
+                }
+            } catch (err) {
+                // 🧯 Fallback duro por seguridad operativa
                 if (finished) return;
-                log("error", `❌ No se pudo iniciar playback: ${err.message}`);
-                cleanup();
-                resolve({ reason: "error" });
-            });
+                log("warn", `⚠️ [PLAYBACK] Bridge.play falló, usando channel.play(): ${err.message}`);
+                try {
+                    const channelPlayback = ari.Playback();
+                    playbackInstance = channelPlayback;
+                    registerPlaybackListeners(channelPlayback);
+                    await channel.play({ media }, channelPlayback);
+                } catch (fallbackErr) {
+                    log("error", `❌ No se pudo iniciar playback: ${fallbackErr.message}`);
+                    cleanup();
+                    resolve({ reason: "error" });
+                }
+            }
+        };
+
+        startPlayback().catch((err) => {
+            if (finished) return;
+            log("error", `❌ Error iniciando playback: ${err.message}`);
+            cleanup();
+            resolve({ reason: "error" });
+        });
     });
 }
 
@@ -232,6 +403,12 @@ export async function recordUserTurn(channel, turnNumber) {
     const wavFile = `${ASTERISK_REC_PATH}/${recId}.wav`;
 
     log("info", `🎙️ [VB V3] Iniciando grabación turno #${turnNumber}: ${recId}`);
+
+    if (config.engine.ENABLE_TURN_RECORDING === false) {
+        log("info", `🎙️ [VB V3] Grabación desactivada por config (ENABLE_TURN_RECORDING=false)`);
+        // Return dummy success so engine flow continues
+        return { ok: true, reason: "disabled", path: null, recId };
+    }
 
     let recordingObj;
     try {
@@ -484,7 +661,7 @@ export async function playStillTherePrompt(ari, channel, openaiClient) {
     }
 }
 
-export async function sendSystemTextAndPlay(ari, channel, openaiClient, text, options = {}) {
+export async function sendSystemTextAndPlay(ari, channel, openaiClient, text, options = {}, voiceBridgeRef = null) {
     try {
         if (channel) {
             log('debug', '⏱️ [KEEP-ALIVE] Iniciando silencio para mantener canal activo...');
@@ -510,7 +687,7 @@ export async function sendSystemTextAndPlay(ari, channel, openaiClient, text, op
         const cmd = `ffmpeg -y -f s16le -ar 24000 -ac 1 -i "${rawPcmFile}" -ar 8000 -ac 1 -c:a pcm_s16le "${finalWavFile}"`;
         await execAsync(cmd);
 
-        await playWithBargeIn(ari, channel, rspId, openaiClient, options);
+        await playWithBargeIn(ari, channel, rspId, openaiClient, options, voiceBridgeRef);
         if (options.bargeIn === false) {
             log("debug", "⏱️ [ORCHESTRATION] Aplicando pausa de seguridad tras audio no-interrumpible");
             await new Promise(r => setTimeout(r, 600));

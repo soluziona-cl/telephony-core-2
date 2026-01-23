@@ -38,7 +38,7 @@ export const voicebotConfigBase = {
         silenceThreshold: 420,
         maxSilenceSeconds: 2.5,
         maxRecordingMs: 6500,
-        talkingDebounceMs: 400,
+        talkingDebounceMs: 150, // 🎯 MEJORA FLUIDEZ: Reducido de 400ms a 150ms para barge-in más rápido
         playbackTimeoutMs: 14000,
         maxWaitMs: 4000,
         minTalkingEvents: 1
@@ -65,6 +65,7 @@ export const voicebotConfigBase = {
         maxTurns: 20,
         maxSilentTurns: 4,
         useModularEngine: false,  // 🔧 Feature flag: Enable modular engine (Phase 4)
+        ENABLE_CONTINUOUS_RECORDING_SEGMENTS: process.env.ENABLE_CONTINUOUS_RECORDING_SEGMENTS === 'true', // 🎙️ Feature flag: Enable continuous recording with segments
         hold: {
             enabled: false,          // 🎵 Feature flag: Enable HOLD with music-on-hold
             enterOnFirstSilence: true,

@@ -53,6 +53,15 @@ export class OpenAIRealtimeClientV3 {
 
     this.isSystemPrompt = false;
     this.isPlaybackActive = false;
+    
+    // 🎯 MEJORA CRÍTICA: Tracking de estabilidad del stream de audio
+    this.audioDeltaTracking = {
+      lastDeltaAt: 0,
+      deltaGapTimer: null,
+      streamStabilityThreshold: 300, // ms sin deltas = stream pausado/estable
+      isStreamActive: false,
+      onStreamStable: null // Callback cuando stream se estabiliza
+    };
   }
 
   /**
@@ -117,7 +126,7 @@ export class OpenAIRealtimeClientV3 {
         modalities: ["text", "audio"],
         instructions: this.instructions,
         voice: this.voice,
-        input_audio_format: "pcm16",
+        input_audio_format: "g711_ulaw",
         output_audio_format: "pcm16",
         input_audio_transcription: {
           model: "whisper-1"
@@ -431,6 +440,12 @@ export class OpenAIRealtimeClientV3 {
 
       case "response.created":
         this.activeResponseId = event.response?.id || null;
+        // 🎯 MEJORA: Reset tracking cuando inicia nueva respuesta
+        this.audioDeltaTracking.lastDeltaAt = Date.now();
+        this.audioDeltaTracking.isStreamActive = true;
+        if (this.audioDeltaTracking.deltaGapTimer) {
+          clearTimeout(this.audioDeltaTracking.deltaGapTimer);
+        }
         break;
 
       case "response.audio_transcript.done":
@@ -440,12 +455,23 @@ export class OpenAIRealtimeClientV3 {
 
       case "response.audio.delta":
         this.handleAudioDelta(event.delta);
+        // 🎯 MEJORA CRÍTICA: Detectar estabilidad del stream
+        this.handleStreamStability();
         break;
 
       case "response.done":
         log("info", "✅ [OpenAI V3] Respuesta completada");
         this.handleResponseDone(event.response);
         this.activeResponseId = null;
+        // 🎯 MEJORA: Marcar stream como finalizado
+        this.audioDeltaTracking.isStreamActive = false;
+        if (this.audioDeltaTracking.deltaGapTimer) {
+          clearTimeout(this.audioDeltaTracking.deltaGapTimer);
+        }
+        // Emitir evento de estabilidad final si hay callback
+        if (this.audioDeltaTracking.onStreamStable) {
+          this.audioDeltaTracking.onStreamStable('stream-complete');
+        }
         break;
 
       case "error":
@@ -458,6 +484,54 @@ export class OpenAIRealtimeClientV3 {
   handleAudioDelta(base64Delta) {
     if (!this.currentAudioChunks) this.currentAudioChunks = [];
     this.currentAudioChunks.push(Buffer.from(base64Delta, "base64"));
+  }
+
+  /**
+   * 🎯 MEJORA CRÍTICA: Detectar estabilidad del stream de audio
+   * Detecta cuando hay una pausa en el stream (gap entre deltas)
+   * Esto permite invocar webhook sin esperar el fin completo del stream
+   */
+  handleStreamStability() {
+    const now = Date.now();
+    const lastDeltaAt = this.audioDeltaTracking.lastDeltaAt;
+    const threshold = this.audioDeltaTracking.streamStabilityThreshold;
+    
+    // Actualizar timestamp del último delta
+    this.audioDeltaTracking.lastDeltaAt = now;
+    
+    // Reset timer anterior
+    if (this.audioDeltaTracking.deltaGapTimer) {
+      clearTimeout(this.audioDeltaTracking.deltaGapTimer);
+    }
+    
+    // Si hay un gap significativo desde el último delta, el stream está pausado
+    if (lastDeltaAt > 0 && (now - lastDeltaAt) > threshold) {
+      log("debug", `⏸️ [OpenAI V3] Stream pausado detectado (gap: ${now - lastDeltaAt}ms)`);
+      // Emitir evento de estabilidad
+      if (this.audioDeltaTracking.onStreamStable) {
+        this.audioDeltaTracking.onStreamStable('stream-paused');
+      }
+    }
+    
+    // 🎯 TIMER: Si no llegan más deltas por threshold ms, considerar stream estable
+    this.audioDeltaTracking.deltaGapTimer = setTimeout(() => {
+      if (this.audioDeltaTracking.isStreamActive) {
+        const gap = Date.now() - this.audioDeltaTracking.lastDeltaAt;
+        log("info", `⏸️ [OpenAI V3] Stream estabilizado (${gap}ms sin deltas) → Listo para webhook`);
+        
+        // Emitir evento de estabilidad
+        if (this.audioDeltaTracking.onStreamStable) {
+          this.audioDeltaTracking.onStreamStable('stream-stable');
+        }
+      }
+    }, threshold);
+  }
+
+  /**
+   * 🎯 MEJORA: Registrar callback para eventos de estabilidad del stream
+   */
+  onStreamStable(callback) {
+    this.audioDeltaTracking.onStreamStable = callback;
   }
 
   handleResponseDone(response) {
@@ -549,5 +623,46 @@ export class OpenAIRealtimeClientV3 {
   async sendSystemText(text) {
     // Usamos role 'assistant' para que OpenAI genere el audio como si él lo dijera
     return await this.sendTextAndWait(text, "assistant");
+  }
+
+  // =========================================================
+  // 🌊 STREAMING SUPPORT (ExternalMedia)
+  // =========================================================
+
+  streamAudio(buffer) {
+    if (!this.isConnected) return;
+
+    // ✅ ARQUITECTURA DESACOPLADA: El canal de entrada siempre escucha
+    // El audio se captura siempre, independiente del estado de playback
+    // La decisión de interrumpir se toma después, gobernada por interruptPolicy del dominio
+    // 
+    // NOTA: isPlaybackActive se mantiene para tracking, pero NO bloquea la captura de audio
+    // La interrupción se evalúa en el engine según interruptPolicy del dominio
+
+    // Send raw audio delta directly (OpenAI handles buffering)
+    // Assuming buffer is correct format (configured in session)
+    this.sendEvent({
+      type: 'input_audio_buffer.append',
+      audio: buffer.toString('base64')
+    });
+  }
+
+  commit() {
+    if (!this.isConnected) {
+      log("warn", "⚠️ [OpenAI V3] commit() llamado pero cliente no conectado");
+      return;
+    }
+    this.lastTranscript = ""; // Reset for new turn
+    this.sendEvent({ type: 'input_audio_buffer.commit' });
+    log("debug", "🔄 [OpenAI V3] Commit enviado al buffer de audio");
+  }
+
+  async waitForTranscript(timeoutMs = 10000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (this.lastTranscript) return this.lastTranscript;
+      await new Promise(r => setTimeout(r, 100));
+    }
+    return "";
   }
 }

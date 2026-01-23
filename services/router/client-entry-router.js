@@ -48,9 +48,8 @@ export async function resolveClientCapsule(mode) {
             log('info', `✅ [ROUTER] Routing '${mode}' to ${clientName} Capsule`);
             return mod.default;
         } catch (err) {
-            log('error', `❌ [ROUTER] Failed to load ${clientName} Capsule: ${err.message}.`);
-            // Continue to legacy fallback if capsule load fails? 
-            // Better to fail safe or fallback. Given migration, fallback is safer for uptimes.
+            log('error', `⛔ [ROUTER] CRITICAL: Failed to load ${clientName} Capsule: ${err.message}. Aborting to prevent regression.`);
+            throw new Error(`CAPSULE_LOAD_FAILED: ${clientName} (${err.message})`);
         }
     }
 

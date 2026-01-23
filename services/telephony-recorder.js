@@ -33,12 +33,17 @@ export async function startRecording(ari, channel, tenantId, linkedId, ani, dnis
 }
 
 export async function stopRecording(ari, recName) {
+    if (!ari?.recordings?.stop) {
+        log("warn", `No se pudo detener grabación ${recName}: ari.recordings.stop no disponible`);
+        return false;
+    }
+
     try {
-        const rec = ari.recordings();
-        rec.name = recName;
-        await rec.stop();
+        await ari.recordings.stop({ recordingName: recName });
         log("info", `🎙️ Grabación detenida: ${recName}`);
+        return true;
     } catch (err) {
         log("warn", `No se pudo detener grabación ${recName}`, err.message);
+        return false;
     }
 }

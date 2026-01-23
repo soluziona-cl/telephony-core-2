@@ -10,17 +10,30 @@ const VOICEBOT_PATH = "/var/lib/asterisk/sounds/voicebot/quintero";
 const VOICE_ID = "marin"; // Voz configurada para Quintero
 
 // Mensajes a generar
+// const MESSAGES = {
+//     "greeting_sofia_2": "Hola, soy Sofia, bienvenido al Consultorio Médico de Quintero. Para poder ayudarlo con su cita médica, primero necesito que me indique su RUT",
+//     "ask_rut": "Por favor, indíqueme su RUT completo, incluyendo el dígito verificador.",
+//     "ask_rut_retry": "Por favor, indíqueme su RUT completo, incluyendo el dígito verificador. Por ejemplo: catorce millones, trescientos cuarenta mil, guión ocho.",
+//     "ask_specialty": "¿Para qué especialidad médica necesita agendar su hora? Por ejemplo, medicina general, control o alguna especialidad en particular.",
+//     "ask_specialty_retry": "¿Podría indicarme la especialidad médica que necesita? Por ejemplo, medicina general o control.",
+//     "ask_specialty_examples": "Por favor, dígame la especialidad. Puede ser: medicina general, pediatría, control, o cualquier otra.",
+//     "offer_alternatives": "No hay horas disponibles para la especialidad indicada. ¿Desea buscar otra especialidad, consultar otra fecha, o hablar con una ejecutiva?",
+//     "transfer_agent": "No he podido escucharle correctamente. Le transferiré con una ejecutiva para continuar su atención. Un momento por favor.",
+//     "farewell": "Muchas gracias, hasta luego."
+// };
+
 const MESSAGES = {
-    "greeting_sofia_2": "Hola, soy Sofia, bienvenido al Consultorio Médico de Quintero. Para poder ayudarlo con su cita médica, primero necesito que me indique su RUT",
+    "greeting_sofia_2": "Hola soy Sofia, bienvenido al Consultorio Médico de Quintero. Para poder ayudarlo con su cita médica, primero necesito que me indique su RUT",
     "ask_rut": "Por favor, indíqueme su RUT completo, incluyendo el dígito verificador.",
     "ask_rut_retry": "Por favor, indíqueme su RUT completo, incluyendo el dígito verificador. Por ejemplo: catorce millones, trescientos cuarenta mil, guión ocho.",
-    "ask_specialty": "¿Para qué especialidad médica necesita agendar su hora? Por ejemplo, medicina general, control o alguna especialidad en particular.",
     "ask_specialty_retry": "¿Podría indicarme la especialidad médica que necesita? Por ejemplo, medicina general o control.",
     "ask_specialty_examples": "Por favor, dígame la especialidad. Puede ser: medicina general, pediatría, control, o cualquier otra.",
     "offer_alternatives": "No hay horas disponibles para la especialidad indicada. ¿Desea buscar otra especialidad, consultar otra fecha, o hablar con una ejecutiva?",
     "transfer_agent": "No he podido escucharle correctamente. Le transferiré con una ejecutiva para continuar su atención. Un momento por favor.",
-    "farewell": "Muchas gracias, hasta luego."
+    "farewell": "Muchas gracias, hasta luego.",
+    "ask_specialty": "¿Qué especialidad médica necesita? Por ejemplo: medicina general, pediatría o control."
 };
+
 
 function loadEnv() {
     const envPath = "/opt/telephony-core/.env";
